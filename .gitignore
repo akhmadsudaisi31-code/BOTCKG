@@ -5,3 +5,8 @@ __pycache__/
 screenshots/
 .env
 .DS_Store
+gui_config.json
+ckg.xlsx
+*.xlsx
+*.bak
+*.log

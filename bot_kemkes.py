@@ -25,10 +25,37 @@ from openpyxl.styles import PatternFill
 from PIL import Image
 
 # ============================================================
-#  KONFIGURASI
+#  GUI INTEGRATION BRIDGE
 # ============================================================
-USERNAME = "sudaisi74@gmail.com"
-PASSWORD = "Bleg@123"
+GUI_BRIDGE_ACTIVE = False
+gui_bridge = None
+current_page = None
+_current_input_task = None  # asyncio.Task yang sedang menjalankan input_pasien
+
+class GUIBridge:
+    def __init__(self):
+        import queue
+        self.log_queue = queue.Queue()
+        self.request_queue = queue.Queue()
+        self.response_queue = queue.Queue()
+        self.running = True
+        self.auto_advance = True
+
+    def request_input(self, req_type, data=None):
+        self.request_queue.put((req_type, data))
+        response = self.response_queue.get()
+        return response
+
+    def log(self, msg, level="INFO"):
+        self.log_queue.put((msg, level))
+
+# ============================================================
+#  KONFIGURASI (Dimuat dinamis dari gui_config.json)
+# ============================================================
+import json
+
+USERNAME = ""
+PASSWORD = ""
 BASE_URL  = "https://sehatindonesiaku.kemkes.go.id"
 HEADLESS  = False
 TIMEOUT   = 30_000
@@ -36,6 +63,21 @@ SCREENSHOT_DIR = Path("screenshots")
 FILE_EXCEL      = Path("ckg.xlsx")
 JEDA_ANTAR_DATA = 1500   # ms jeda antar pasien
 MULAI_DARI      = 1      # baris ke-berapa (No.) untuk mulai, berguna jika resume
+
+# Muat kredensial dan konfigurasi dari gui_config.json untuk menghindari hardcode kredensial
+CONFIG_FILE = Path("gui_config.json")
+if CONFIG_FILE.exists():
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config_data = json.load(f)
+            USERNAME = config_data.get("email", USERNAME)
+            PASSWORD = config_data.get("password", PASSWORD)
+            if "excel_path" in config_data:
+                FILE_EXCEL = Path(config_data["excel_path"])
+            if "headless" in config_data:
+                HEADLESS = config_data["headless"]
+    except Exception:
+        pass
 
 BULAN_ID = {
     1:"Jan", 2:"Feb", 3:"Mar", 4:"Apr", 5:"Mei", 6:"Jun",
@@ -81,7 +123,8 @@ GARIS  = "─" * 58
 GARIS2 = "═" * 58
 
 def log(msg: str, level: str = "INFO"):
-    ts   = datetime.now().strftime("%H:%M:%S")
+    ts_time = datetime.now().strftime("%H:%M:%S")
+    ts_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ikon = {"INFO":"ℹ️ ","OK":"✅","WARN":"⚠️ ","ERR":"❌","WAIT":"⏳","BOT":"🤖"}.get(level,"  ")
     
     color = RESET
@@ -98,7 +141,20 @@ def log(msg: str, level: str = "INFO"):
     elif level == "WAIT":
         color = MAGENTA
 
-    print(f"{GRAY}[{ts}]{RESET} {color}{ikon} {msg}{RESET}")
+    # Cetak ke terminal
+    print(f"{GRAY}[{ts_time}]{RESET} {color}{ikon} {msg}{RESET}")
+    
+    # Kirim ke GUI
+    if GUI_BRIDGE_ACTIVE and gui_bridge:
+        gui_bridge.log(msg, level)
+
+    # Catat ke file log lokal (bot_run.log)
+    try:
+        clean_msg = re.sub(r'\033\[[0-9;]*m', '', msg)
+        with open("bot_run.log", "a", encoding="utf-8") as log_file:
+            log_file.write(f"[{ts_date}] [{level}] {clean_msg}\n")
+    except Exception:
+        pass
 
 
 def print_box_line(content: str, color: str = YELLOW, text_color: str = WHITE, is_bold: bool = False, inner_width: int = 50):
@@ -165,6 +221,10 @@ def cetak_data_pasien(nomor: int, total: int, nama: str, nik: str, jk: str, tgl:
     print(f"  {BLUE}╚{border}╝{RESET}")
     print()
 
+    # Kirim info pasien ke GUI bridge agar label Nama & NIK terupdate
+    if GUI_BRIDGE_ACTIVE and gui_bridge:
+        gui_bridge.log(f"__PATIENT_INFO__|{nomor}|{total}|{nama}|{nik}", "INFO")
+
 
 # ============================================================
 #  HELPER
@@ -206,17 +266,103 @@ def image_to_binary_ascii(base64_str, width=50):
 
 
 # Exception khusus agar input_pasien bisa sinyal SKIP ke loop utama
-class SkipPasien(Exception):
+class SkipPasien(BaseException):
     pass
+
+class StopBotException(BaseException):
+    pass
+
+def check_stop_request():
+    if GUI_BRIDGE_ACTIVE and gui_bridge:
+        if not gui_bridge.running:
+            raise StopBotException("Bot dihentikan oleh user")
+        if getattr(gui_bridge, "skip_requested", False) or getattr(gui_bridge, "skip_active", False):
+            gui_bridge.skip_requested = False
+            gui_bridge.skip_active = False
+            raise SkipPasien("Skip diminta oleh user melalui GUI")
+
+
+async def poll_gui_signals():
+    """
+    Background task yang memantau sinyal stop/skip dari GUI.
+    Ketika skip diterima: cancel asyncio.Task input_pasien yang sedang berjalan
+    agar CancelledError merambat keluar secara bersih tanpa tertahan oleh
+    try-except Exception lokal di dalam input_pasien.
+    """
+    global current_page, _current_input_task
+    while True:
+        try:
+            await asyncio.sleep(0.05)  # poll lebih cepat (50ms) agar lebih responsif
+            if not GUI_BRIDGE_ACTIVE or not gui_bridge:
+                continue
+
+            # ── Cek request STOP ─────────────────────────────
+            if not gui_bridge.running:
+                if current_page and not current_page.is_closed():
+                    try:
+                        await current_page.close()
+                    except Exception:
+                        pass
+                # Cancel task aktif jika ada
+                if _current_input_task and not _current_input_task.done():
+                    _current_input_task.cancel()
+                break
+
+            # ── Cek request SKIP ─────────────────────────────
+            if getattr(gui_bridge, "skip_requested", False):
+                gui_bridge.skip_requested = False
+                gui_bridge.skip_active = True
+
+                # 1. Cancel asyncio.Task input_pasien agar keluar bersih
+                #    CancelledError tidak tertangkap oleh except Exception,
+                #    sehingga pasti merambat ke loop utama.
+                if _current_input_task and not _current_input_task.done():
+                    _current_input_task.cancel()
+
+                # 2. Navigasi browser ke form pendaftaran sekaligus
+                #    agar halaman sudah siap ketika loop utama memanggil
+                #    buka_form_daftar_baru() untuk pasien berikutnya.
+                if current_page and not current_page.is_closed():
+                    try:
+                        await current_page.goto(
+                            f"{BASE_URL}/ckg-pendaftaran-individu",
+                            wait_until="domcontentloaded",
+                            timeout=8000
+                        )
+                    except Exception:
+                        pass  # halaman mungkin sudah pindah karena cancel
+
+        except Exception:
+            pass
 
 
 async def screenshot(page: Page, nama: str):
     pass
 
 
+async def force_js_click(locator) -> bool:
+    """
+    Memaksakan klik elemen menggunakan JavaScript injection untuk memotong Actionability checks Playwright.
+    Sangat ampuh untuk mengatasi elemen yang tertutup overlay/backdrop/dialog lain.
+    """
+    try:
+        if hasattr(locator, "first"):
+            target = locator.first
+        else:
+            target = locator
+        
+        if await target.count() > 0:
+            await target.evaluate("el => el.click()")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def klik_opsional(page: Page, locator, timeout: int = 4000):
     try:
-        await locator.click(timeout=timeout)
+        if not await force_js_click(locator):
+            await locator.click(timeout=timeout)
         await page.wait_for_timeout(400)
     except Exception:
         pass
@@ -227,54 +373,96 @@ async def klik_popup_kuota(page: Page):
     Deteksi popup 'Kuota Pemeriksaan Habis' dan tangani 2 tahap otomatis:
       Tahap 1 — popup kuota: klik 'Lanjut' (btn-outline-primary)
       Tahap 2 — konfirmasi warning: klik 'Lanjut' (btn-fill-warning)
-    Jika kuota benar-benar habis dan tidak bisa lanjut, klik 'Pilih Tanggal Lain'.
+    Memeriksa hingga 5 kali dan memverifikasi popup benar-benar tertutup.
+    Menggunakan force_js_click untuk mencegah hambatan akibat overlay.
     """
-    try:
-        # Tahap 1: Popup kuota di dalam form modal (z-1000)
-        pilih_lain = page.locator("button").filter(has_text=re.compile(r"Pilih Tanggal Lain", re.IGNORECASE)).first
-        if await pilih_lain.is_visible():
-            log("  ⚠️  Popup 'Kuota Pemeriksaan Habis' terdeteksi.", "WARN")
-            
-            # Cari tombol Lanjut di popup yang sama, lebih leluasa pencariannya
-            lanjut_btn = page.locator("div.z-1000 button, div.z-1100 button").filter(has_text=re.compile(r"Lanjut", re.IGNORECASE)).first
-            if await lanjut_btn.is_visible():
-                log("  🤖 Mengklik 'Lanjut' di popup kuota...", "BOT")
-                await lanjut_btn.click()
-                await page.wait_for_timeout(800)
-            else:
-                # Sesuai instruksi: pilih tanggal lain lalu klik tombol ke-14 di grid kalender
-                log("  ⚠️  Tombol Lanjut tidak tersedia, mengklik 'Pilih Tanggal Lain'...", "WARN")
-                await pilih_lain.click()
-                await page.wait_for_timeout(500)
-                
-                # Memilih tanggal alternatif (tombol ke-14 di grid)
-                try:
-                    grid = page.locator(".form-data-individu form .grid-cols-7.mt-2")
-                    alt_btn = grid.locator("button").nth(13) # Index 13 adalah tombol ke-14
-                    if await alt_btn.is_visible():
-                        await alt_btn.click()
-                        await page.wait_for_timeout(500)
-                        log("  ✓ Tanggal pemeriksaan alternatif (grid ke-14) berhasil dipilih.", "OK")
-                except Exception as e:
-                    log(f"  ⚠️  Gagal memilih tanggal alternatif: {e}", "WARN")
-    except Exception:
-        pass
+    KUOTA_KEYWORDS = ["kuota pemeriksaan habis", "kuota pemeriksaan", "kuota habis"]
 
-    try:
-        # Tahap 2: Konfirmasi warning (z-99999, body-level)
-        # Selector khusus untuk popup warning (btn-fill-warning)
-        warning_btn = page.locator("button.btn-fill-warning").filter(has_text=re.compile(r"\bLanjut\b", re.IGNORECASE)).first
-        if not await warning_btn.is_visible():
-            # Coba cari Lanjut di div z-99999
-            warning_btn = page.locator("div.z-99999 button").filter(has_text=re.compile(r"\bLanjut\b", re.IGNORECASE)).first
+    async def popup_kuota_masih_ada() -> bool:
+        """Cek apakah popup kuota masih terlihat di halaman."""
+        try:
+            # Cara paling andal: cek tombol 'Pilih Tanggal Lain' yang hanya ada di popup kuota
+            btn_pilih_lain = page.locator("button").filter(
+                has_text=re.compile(r"Pilih Tanggal Lain", re.IGNORECASE)
+            ).first
+            if await btn_pilih_lain.is_visible():
+                return True
+            # Cek lewat teks popup secara cepat menggunakan locator text regex
+            popup_text_locator = page.locator("text=/kuota pemeriksaan habis|kuota pemeriksaan|kuota habis/i").first
+            if await popup_text_locator.is_visible():
+                return True
+            return False
+        except Exception:
+            return False
 
-        if await warning_btn.is_visible():
-            log("  🤖 Mengklik konfirmasi 'Lanjut' (warning)...", "BOT")
-            await warning_btn.click()
-            await page.wait_for_timeout(600)
-            log("  ✓ Popup kuota ditangani, melanjutkan pendaftaran.", "OK")
-    except Exception:
-        pass
+    # Loop hingga popup kuota benar-benar tertutup (maks 5 percobaan)
+    for attempt in range(1, 6):
+        if not await popup_kuota_masih_ada():
+            break  # popup sudah tidak ada, selesai
+
+        log(f"  ⚠️  Popup 'Kuota Pemeriksaan Habis' terdeteksi (percobaan {attempt}/5).", "WARN")
+
+        try:
+            # Tahap 1: Klik tombol 'Lanjut' di dalam popup kuota
+            pilih_lain = page.locator("button").filter(
+                has_text=re.compile(r"Pilih Tanggal Lain", re.IGNORECASE)
+            ).first
+
+            if await pilih_lain.is_visible():
+                # Popup kuota masih ada — cari tombol Lanjut
+                lanjut_btn = page.locator(
+                    "button.btn-outline-primary, div.z-1000 button, div.z-1100 button"
+                ).filter(has_text=re.compile(r"\bLanjut\b", re.IGNORECASE)).first
+
+                if await lanjut_btn.is_visible():
+                    log("  🤖 Mengklik 'Lanjut' di popup kuota...", "BOT")
+                    if not await force_js_click(lanjut_btn):
+                        await lanjut_btn.click(timeout=2000)
+                    await page.wait_for_timeout(600)
+                else:
+                    # Tidak ada Lanjut — pilih tanggal lain
+                    log("  ⚠️  Tombol Lanjut tidak ada, mengklik 'Pilih Tanggal Lain'...", "WARN")
+                    if not await force_js_click(pilih_lain):
+                        await pilih_lain.click(timeout=2000)
+                    await page.wait_for_timeout(500)
+                    try:
+                        grid = page.locator(".form-data-individu form .grid-cols-7.mt-2")
+                        alt_btn = grid.locator("button").nth(13)
+                        if await alt_btn.is_visible():
+                            if not await force_js_click(alt_btn):
+                                await alt_btn.click(timeout=2000)
+                            await page.wait_for_timeout(500)
+                            log("  ✓ Tanggal pemeriksaan alternatif berhasil dipilih.", "OK")
+                    except Exception as e:
+                        log(f"  ⚠️  Gagal memilih tanggal alternatif: {e}", "WARN")
+        except Exception:
+            pass
+
+        try:
+            # Tahap 2: Konfirmasi warning (btn-fill-warning atau div.z-99999)
+            warning_btn = page.locator("button.btn-fill-warning").filter(
+                has_text=re.compile(r"\bLanjut\b", re.IGNORECASE)
+            ).first
+            if not await warning_btn.is_visible():
+                warning_btn = page.locator("div.z-99999 button").filter(
+                    has_text=re.compile(r"\bLanjut\b", re.IGNORECASE)
+                ).first
+            if await warning_btn.is_visible():
+                log("  🤖 Mengklik konfirmasi 'Lanjut' (warning)...", "BOT")
+                if not await force_js_click(warning_btn):
+                    await warning_btn.click(timeout=2000)
+                await page.wait_for_timeout(600)
+        except Exception:
+            pass
+
+        # Beri waktu halaman merespons sebelum cek ulang
+        await page.wait_for_timeout(600)
+
+    # Verifikasi akhir
+    if await popup_kuota_masih_ada():
+        log("  ⚠️  Popup kuota masih ada setelah 5 percobaan. Melanjutkan paksa...", "WARN")
+    else:
+        log("  ✓ Popup kuota berhasil ditutup.", "OK")
 
 
 async def cek_sesi_berakhir(page: Page, username: str = None, password: str = None) -> bool:
@@ -430,7 +618,11 @@ async def cek_popup_kategori_pasien(page: Page):
             
             # Tanya user untuk konfirmasi lolos/skip
             while True:
-                pilihan = input("\n  ❓ Konfirmasi status kategori pasien ini (l = Lolos / s = Skip): ").strip().lower()
+                if GUI_BRIDGE_ACTIVE and gui_bridge:
+                    pilihan = gui_bridge.request_input("kategori_pasien", msg_text)
+                else:
+                    pilihan = input("\n  ❓ Konfirmasi status kategori pasien ini (l = Lolos / s = Skip): ").strip().lower()
+                
                 if pilihan in ["l", "lolos"]:
                     log("  ✓ Pasien diloloskan untuk melanjutkan pendaftaran.", "OK")
                     break
@@ -438,7 +630,8 @@ async def cek_popup_kategori_pasien(page: Page):
                     log("  ⏭ Pasien di-skip sesuai permintaan user.", "WARN")
                     raise SkipPasien("Kategori pasien dilewati (user skip)")
                 else:
-                    print("Input tidak valid. Masukkan 'l' atau 's'.")
+                    if not GUI_BRIDGE_ACTIVE:
+                        print("Input tidak valid. Masukkan 'l' atau 's'.")
     except SkipPasien:
         raise
     except Exception:
@@ -447,85 +640,202 @@ async def cek_popup_kategori_pasien(page: Page):
 
 async def cek_popup_tidak_valid(page: Page) -> bool:
     """
-    Mendeteksi popup 'data tidak valid' secara cerdas berdasarkan konten teksnya,
-    dan mendukung selector/xpath khusus dari user.
+    Deteksi popup 'data valid' atau 'data tidak valid' secara agresif dengan polling.
+    Menunggu hingga 3.0 detik agar popup muncul, atau mendeteksi jika halaman sudah berpindah.
+    Menggunakan pencarian teks native dan mengurangi jeda polling untuk kecepatan maksimal.
     """
     try:
-        # 1. Cek User XPath Spesifik Terlebih Dahulu (Prioritas Utama)
-        xpath_txt_popup = 'xpath=//*[@id="__nuxt"]/main/div/div[1]/section[2]/div/div/div/div[2]/div/div[3]/div[5]/div[2]/div/div/div[6]/div[2]/div[2]/div/div/div[1]/div'
-        xpath_btn_popup = 'xpath=//*[@id="__nuxt"]/main/div/div[1]/section[2]/div/div/div/div[2]/div/div[3]/div[5]/div[2]/div/div/div[6]/div[2]/div[2]/div/div/div[3]/div/button'
-        
-        btn_el = page.locator(xpath_btn_popup).first
-        if await is_element_really_visible(btn_el):
-            txt_el = page.locator(xpath_txt_popup).first
-            txt = await txt_el.inner_text() if await txt_el.count() > 0 else ""
-            txt_lower = txt.lower()
-            log(f"  🔍 Teks popup terdeteksi (user xpath): '{txt.strip().replace(chr(10), ' ')}'", "INFO")
-            
-            # Cek jika mengandung kata "tidak valid", "salah", "gagal", "tidak terdaftar", "tidak cocok", dsb.
-            is_tidak_valid = "tidak valid" in txt_lower or "tidak terdaftar" in txt_lower or "salah" in txt_lower or "gagal" in txt_lower or "tidak cocok" in txt_lower or "tidak" in txt_lower
-            
-            if is_tidak_valid or (not txt):  # Jika terindikasi tidak valid atau teks kosong
-                log("  ⚠️ Popup data tidak valid terkonfirmasi via XPath!", "WARN")
-                log(f"  🤖 Mengklik tombol untuk menutup popup tidak valid...", "BOT")
-                await btn_el.click()
-                await page.wait_for_timeout(800)
-                return True
-            
-            # Cek jika terindikasi valid / konfirmasi
-            is_valid = "valid" in txt_lower and "tidak" not in txt_lower
-            if is_valid or "lanjut" in txt_lower:
-                log("  ✓ Popup data valid / konfirmasi terdeteksi via XPath. Mengklik tombol konfirmasi...", "BOT")
-                await btn_el.click()
-                await page.wait_for_timeout(800)
-                return False
+        # XPath untuk tombol Selanjutnya Step 1 (jika tombol ini hilang/tidak visible, artinya halaman sudah berpindah)
+        xpath_btn_selanjutnya_step1 = (
+            "//div[@id='__nuxt']/main/div/div[1]/section[2]/div/div/div/div[2]/div/div[3]/div[5]/div[2]/div/div/div[6]/div[2]/div[2]/div/div/div[3]/div/button"
+        )
 
-        # 2. Cari modal card umum (z-1000/z-1100)
-        cards = page.locator("div.fixed.z-1000 div.rounded-lg.bg-white, div.fixed.z-1100 div.rounded-lg.bg-white, div.fixed.z-1000, div.fixed.z-1100")
-        count = await cards.count()
-        
-        for i in range(count):
-            card = cards.nth(i)
-            if await is_element_really_visible(card):
-                text = await card.inner_text()
-                text_lower = text.lower()
+        log("  ⏳ Menunggu deteksi popup validasi data (polling super cepat)...", "WAIT")
+
+        # Polling setiap 100ms selama maksimal 30 kali (total 3.0 detik)
+        for attempt in range(30):
+            # 1. Cek jika halaman sudah berpindah (tidak ada popup, submit berhasil langsung)
+            try:
+                btn_sel_xpath = page.locator(f"xpath={xpath_btn_selanjutnya_step1}").first
+                btn_sel_role = page.get_by_role("button", name="Selanjutnya").first
                 
-                # Cari tombol konfirmasi "Data Valid" atau "Lanjutkan"
-                btn_confirm = card.locator("button, div[role='button']").filter(
-                    has_text=re.compile(r"^(Data Valid|Ya, Data Valid|Ya|Lanjutkan|Valid|Ya, Lanjutkan)$", re.IGNORECASE)
+                # Jika tombol Selanjutnya sudah tidak visible, berarti sudah berhasil submit dan pindah halaman
+                if not (await btn_sel_xpath.is_visible()) and not (await btn_sel_role.is_visible()):
+                    log("  ✓ Halaman terdeteksi sudah berpindah (tidak ada popup pendaftaran yang menghalangi).", "OK")
+                    return False
+            except Exception:
+                pass
+
+            # 2. Cek spesifik popup "Data peserta tidak valid" via teks native (sangat cepat)
+            tidak_valid_el = page.locator("text=/data peserta tidak valid|nik tidak valid|nik salah|tidak terdaftar/i").first
+            if await tidak_valid_el.is_visible():
+                log("  ⚠️ Popup 'Data peserta tidak valid' terdeteksi secara spesifik.", "WARN")
+                popup_peserta_tidak_valid = page.locator("div.fixed.z-1000, div.fixed.z-1100, div[class*='z-1000'], div[class*='z-1100']").filter(
+                    has_text=re.compile(r"Data peserta tidak valid|nik tidak valid|nik salah|tidak terdaftar", re.IGNORECASE)
                 ).first
+                # Cari tombol Periksa Kembali atau Tutup di dalam popup ini
+                btn_periksa = popup_peserta_tidak_valid.locator("button, [role='button'], div.cursor-pointer").filter(
+                    has_text=re.compile(r"(Periksa|Tutup|Kembali|OK)", re.IGNORECASE)
+                ).first
+                if await btn_periksa.is_visible():
+                    log(f"  🤖 Menutup popup tidak valid: '{await btn_periksa.inner_text()}'...", "BOT")
+                    if not await force_js_click(btn_periksa):
+                        await btn_periksa.click(timeout=2000)
+                else:
+                    btn_any = popup_peserta_tidak_valid.locator("button, [role='button'], div.cursor-pointer").first
+                    if await btn_any.count() > 0:
+                        log("  🤖 Menutup popup tidak valid via tombol alternatif...", "BOT")
+                        if not await force_js_click(btn_any):
+                            await btn_any.click(timeout=2000)
+                await page.wait_for_timeout(300) # Kurangi delay dari 800ms ke 300ms
+                return True  # kembalikan True karena data tidak valid (skip)
+
+            # 3. Cek spesifik popup "Data peserta valid" via teks native (sangat cepat)
+            valid_el = page.locator("text=/data peserta valid|data anda valid/i").first
+            if await valid_el.is_visible():
+                log("  ✓ Popup 'Data peserta valid' terdeteksi secara spesifik.", "OK")
+                popup_peserta_valid = page.locator("div.fixed.z-1000, div.fixed.z-1100, div[class*='z-1000'], div[class*='z-1100']").filter(
+                    has_text=re.compile(r"Data peserta valid", re.IGNORECASE)
+                ).first
+                btn_lanjutkan = popup_peserta_valid.locator("button, [role='button'], div.cursor-pointer").filter(
+                    has_text=re.compile(r"Lanjutkan", re.IGNORECASE)
+                ).first
+                if await btn_lanjutkan.is_visible():
+                    log(f"  🚀 Mengklik tombol 'Lanjutkan' pada popup: '{await btn_lanjutkan.inner_text()}'...", "BOT")
+                    if not await force_js_click(btn_lanjutkan):
+                        await btn_lanjutkan.click(timeout=2000)
+                else:
+                    btn_any = popup_peserta_valid.locator("button, [role='button'], div.cursor-pointer").first
+                    if await btn_any.count() > 0:
+                        log("  🚀 Mengklik tombol alternatif pada popup data peserta valid...", "BOT")
+                        if not await force_js_click(btn_any):
+                            await btn_any.click(timeout=2000)
+                await page.wait_for_timeout(300) # Kurangi delay dari 800ms ke 300ms
+                return False  # kembalikan False karena data valid (lanjut)
+
+            # 4. Scan Strategi 1: XPath spesifik user (Prioritas Utama)
+            try:
+                xpath_txt_popup = 'xpath=//*[@id="__nuxt"]/main/div/div[1]/section[2]/div/div/div/div[2]/div/div[3]/div[5]/div[2]/div/div/div[6]/div[2]/div[2]/div/div/div[1]/div'
+                xpath_btn_popup_new = 'xpath=//*[@id="__nuxt"]/main/div/div[1]/section[2]/div/div/div/div[2]/div/div[3]/div[4]/div[2]/div/div/div[6]/div[2]/div[2]/div/div/div[3]/div/button'
+                xpath_btn_popup_old = 'xpath=//*[@id="__nuxt"]/main/div/div[1]/section[2]/div/div/div/div[2]/div/div[3]/div[5]/div[2]/div/div/div[6]/div[2]/div[2]/div/div/div[3]/div/button'
                 
-                # Jika ada tombol "Data Valid" / konfirmasi, klik tombol tersebut untuk melanjutkan
-                if await btn_confirm.count() > 0 and await is_element_really_visible(btn_confirm):
-                    log(f"  ✓ Terdeteksi popup konfirmasi. Mengklik tombol konfirmasi '{await btn_confirm.inner_text()}'...", "BOT")
-                    await btn_confirm.click()
-                    await page.wait_for_timeout(800)
-                    log("  ✓ Popup konfirmasi ditutup (Lanjut).", "OK")
-                    return False
+                btn_el = page.locator(xpath_btn_popup_new).first
+                if not await btn_el.is_visible():
+                    btn_el = page.locator(xpath_btn_popup_old).first
 
-                # Jika HANYA popup error / peringatan (data tidak terdaftar/salah)
-                is_tidak_valid = "tidak valid" in text_lower or "tidak terdaftar" in text_lower or "salah" in text_lower or "gagal" in text_lower
-                is_valid = "data valid" in text_lower or ("valid" in text_lower and "tidak" not in text_lower)
+                if await btn_el.is_visible():
+                    txt_el = page.locator(xpath_txt_popup).first
+                    txt = await txt_el.inner_text() if await txt_el.count() > 0 else ""
+                    txt_lower = txt.lower()
+                    
+                    if "nomor whatsapp" in txt_lower or "tanggal lahir" in txt_lower or "isi data wali" in txt_lower:
+                        pass
+                    elif "kuota pemeriksaan" in txt_lower or "kuota habis" in txt_lower:
+                        pass
+                    else:
+                        log(f"  🔍 Teks popup (user XPath): '{txt.strip()[:80]}'", "INFO")
+                        is_tidak_valid = any(k in txt_lower for k in ["tidak valid", "tidak terdaftar", "salah", "gagal", "tidak cocok"])
+                        if is_tidak_valid or not txt:
+                            log("  ⚠️ Popup NIK TIDAK VALID terkonfirmasi via XPath — menutup popup.", "WARN")
+                            if not await force_js_click(btn_el):
+                                await btn_el.click(timeout=2000)
+                            await page.wait_for_timeout(300)
+                            return True
+                        is_valid = ("valid" in txt_lower and "tidak" not in txt_lower) or "peserta" in txt_lower or "lanjut" in txt_lower
+                        if is_valid:
+                            log("  ✓ Popup NIK VALID terkonfirmasi via XPath — melanjutkan.", "OK")
+                            if not await force_js_click(btn_el):
+                                await btn_el.click(timeout=2000)
+                            await page.wait_for_timeout(300)
+                            return False
+            except Exception:
+                pass
 
-                if is_tidak_valid:
-                    log(f"  ⚠️  Popup data tidak valid terdeteksi: '{text.strip().replace(chr(10), ' ')[:100]}...'", "WARN")
-                    # Cari tombol untuk menutup popup (Ok / Tutup / Batal)
-                    btn_close = card.locator("button, div[role='button']").first
-                    if await btn_close.count() > 0 and await is_element_really_visible(btn_close):
-                        log(f"  🤖 Mengklik tombol tutup popup '{await btn_close.inner_text()}'...", "BOT")
-                        await btn_close.click()
-                        await page.wait_for_timeout(800)
-                    return True
-                elif is_valid:
-                    log(f"  ✓ Popup data valid terdeteksi: '{text.strip().replace(chr(10), ' ')[:100]}...'", "OK")
-                    btn_close = card.locator("button, div[role='button']").first
-                    if await btn_close.count() > 0 and await is_element_really_visible(btn_close):
-                        await btn_close.click()
-                        await page.wait_for_timeout(800)
-                    return False
+            # 5. Scan Strategi 2: Scan semua elemen fixed/modal yang visible (Menggunakan native .is_visible() untuk kecepatan)
+            try:
+                modal_selectors = [
+                    "div.fixed.z-9000",
+                    "div.fixed.z-1100",
+                    "div.fixed.z-1000",
+                    "div[class*='z-9000']",
+                    "div[class*='z-1100']",
+                    "div[class*='z-1000']",
+                    "div[role='dialog']",
+                    "div[role='alertdialog']",
+                ]
+
+                for sel in modal_selectors:
+                    elements = page.locator(sel)
+                    cnt = await elements.count()
+                    for i in range(cnt):
+                        el = elements.nth(i)
+                        if not await el.is_visible():
+                            continue
+                        text = (await el.inner_text() or "").strip()
+                        if not text:
+                            continue
+                        text_lower = text.lower()
+
+                        if "nomor whatsapp" in text_lower or "tanggal lahir" in text_lower or "isi data wali" in text_lower:
+                            continue
+                        if "kuota pemeriksaan" in text_lower or "kuota habis" in text_lower:
+                            continue
+
+                        is_invalid_kw = any(k in text_lower for k in ["tidak valid", "tidak terdaftar", "data tidak", "nik tidak", "nik salah", "gagal", "tidak cocok", "tidak ditemukan", "tidak aktif"])
+                        is_valid_kw = (
+                            any(k in text_lower for k in ["data valid", "data anda valid", "peserta valid", "sudah terdaftar", "berhasil terverifikasi", "lanjutkan pendaftaran", "data peserta valid"])
+                            or ("valid" in text_lower and "tidak" not in text_lower)
+                        )
+
+                        if not (is_valid_kw or is_invalid_kw):
+                            continue
+
+                        if is_invalid_kw:
+                            log(f"  ⚠️ Popup TIDAK VALID terdeteksi: '{text[:100]}'", "WARN")
+                            btn = el.locator("button, [role='button'], div.cursor-pointer").first
+                            if await btn.count() > 0 and await btn.is_visible():
+                                log(f"  🤖 Menutup popup tidak valid: '{await btn.inner_text()}'...", "BOT")
+                                if not await force_js_click(btn):
+                                    await btn.click(timeout=2000)
+                                await page.wait_for_timeout(300)
+                            return True
+
+                        if is_valid_kw:
+                            log(f"  ✓ Popup VALID terdeteksi: '{text[:100]}'", "OK")
+                            btn_confirm = el.locator("button, [role='button'], div.cursor-pointer").filter(
+                                has_text=re.compile(r"(Data Valid|Ya|Lanjut|OK|Konfirmasi)", re.IGNORECASE)
+                            ).first
+                            if await btn_confirm.count() > 0 and await btn_confirm.is_visible():
+                                log(f"  🚀 Mengklik konfirmasi valid: '{await btn_confirm.inner_text()}'...", "BOT")
+                                if not await force_js_click(btn_confirm):
+                                    await btn_confirm.click(timeout=2000)
+                            else:
+                                btn_any = el.locator("button, [role='button'], div.cursor-pointer").first
+                                if await btn_any.count() > 0:
+                                    log("  🚀 Mengklik tombol alternatif di popup valid...", "BOT")
+                                    if not await force_js_click(btn_any):
+                                        await btn_any.click(timeout=2000)
+                            await page.wait_for_timeout(300)
+                            return False
+            except Exception:
+                pass
+
+            # Beri jeda sebelum polling berikutnya (100ms)
+            await page.wait_for_timeout(100)
+
+        # ── Strategi 3: Fallback teks cepat ──
+        try:
+            invalid_text_locator = page.locator("text=/nik tidak valid|nik salah|data tidak valid|tidak terdaftar/i").first
+            if await invalid_text_locator.is_visible():
+                log("  ⚠️ Terdeteksi teks 'tidak valid' di halaman (fallback cepat).", "WARN")
+                return True
+        except Exception:
+            pass
 
     except Exception as e:
-        log(f"  ⚠️  Gagal mengecek/menutup popup tidak valid: {e}", "WARN")
+        log(f"  ⚠️ Gagal mengecek popup valid/tidak valid: {e}", "WARN")
+    
+    log("  ✓ Tidak ada popup validasi yang terdeteksi. Melanjutkan...", "OK")
     return False
 
 
@@ -563,6 +873,13 @@ def update_excel_row_color(no_value, color_type):
             if fill:
                 for col_idx in range(1, ws.max_column + 1):
                     ws.cell(row=target_row, column=col_idx).fill = fill
+                # Backup file Excel sebelum melakukan penyimpanan
+                import shutil
+                try:
+                    backup_path = FILE_EXCEL.with_suffix(FILE_EXCEL.suffix + ".bak")
+                    shutil.copy2(FILE_EXCEL, backup_path)
+                except Exception as e_bak:
+                    log(f"Gagal membuat backup Excel sebelum menyimpan: {e_bak}", "WARN")
                 wb.save(FILE_EXCEL)
                 log(f"Baris Excel No.{no_value} berhasil diwarnai {color_type}.", "OK")
     except Exception as e:
@@ -653,19 +970,24 @@ async def login(page: Page, username: str = None, password: str = None):
                             captcha_img = loc.first
                             break
                     
+                    img_bytes = None
                     if captcha_img:
                         img_bytes = await captcha_img.screenshot()
-                        base64_str = base64.b64encode(img_bytes).decode('utf-8')
-                        ascii_art = image_to_binary_ascii(base64_str)
-                        print("\n" + "=" * 54)
-                        print("  [ KODE CAPTCHA DI BAWAH INI ]")
-                        print("=" * 54)
-                        print(ascii_art)
-                        print("=" * 54 + "\n")
+                        if not GUI_BRIDGE_ACTIVE:
+                            base64_str = base64.b64encode(img_bytes).decode('utf-8')
+                            ascii_art = image_to_binary_ascii(base64_str)
+                            print("\n" + "=" * 54)
+                            print("  [ KODE CAPTCHA DI BAWAH INI ]")
+                            print("=" * 54)
+                            print(ascii_art)
+                            print("=" * 54 + "\n")
                 except Exception:
                     pass
 
-                captcha_val = input("  >> Masukkan Kode CAPTCHA yang tampil di browser: ").strip()
+                if GUI_BRIDGE_ACTIVE and gui_bridge:
+                    captcha_val = gui_bridge.request_input("captcha", img_bytes)
+                else:
+                    captcha_val = input("  >> Masukkan Kode CAPTCHA yang tampil di browser: ").strip()
                 await captcha_field.fill(captcha_val)
                 await page.wait_for_timeout(200)
                 log(f"Mengisi CAPTCHA: {captcha_val}", "OK")
@@ -690,18 +1012,34 @@ async def login(page: Page, username: str = None, password: str = None):
             break
         else:
             log(f"Browser belum masuk ke Dashboard (URL saat ini: {current_url})", "WARN")
-            print("  Pilih tindakan:")
-            print("  [1] Ulangi proses login (halaman akan dimuat ulang)")
-            print("  [2] Masukkan Email & Kata Sandi baru")
-            print("  [3] Paksa lanjut (abaikan deteksi dashboard)")
-            pilihan = input("  >> Masukkan pilihan [1/2/3, default: 1]: ").strip()
-            
-            if pilihan == "2":
-                user_email = input("  >> Masukkan Email baru: ").strip()
-                user_pass  = input("  >> Masukkan Kata sandi baru: ").strip()
-            elif pilihan == "3":
-                log("Memaksa lanjut sesuai instruksi user...", "WARN")
-                break
+            if GUI_BRIDGE_ACTIVE and gui_bridge:
+                res = gui_bridge.request_input("login_failure", current_url)
+                if isinstance(res, tuple) and len(res) == 3:
+                    pilihan, email_new, pass_new = res
+                else:
+                    pilihan = str(res)
+                    email_new = None
+                    pass_new = None
+                    
+                if pilihan == "2":
+                    user_email = email_new
+                    user_pass = pass_new
+                elif pilihan == "3":
+                    log("Memaksa lanjut sesuai instruksi user...", "WARN")
+                    break
+            else:
+                print("  Pilih tindakan:")
+                print("  [1] Ulangi proses login (halaman akan dimuat ulang)")
+                print("  [2] Masukkan Email & Kata Sandi baru")
+                print("  [3] Paksa lanjut (abaikan deteksi dashboard)")
+                pilihan = input("  >> Masukkan pilihan [1/2/3, default: 1]: ").strip()
+                
+                if pilihan == "2":
+                    user_email = input("  >> Masukkan Email baru: ").strip()
+                    user_pass  = input("  >> Masukkan Kata sandi baru: ").strip()
+                elif pilihan == "3":
+                    log("Memaksa lanjut sesuai instruksi user...", "WARN")
+                    break
             # default: loop repeats, loading page again
 
     # Popup opsional setelah login
@@ -718,7 +1056,16 @@ async def login(page: Page, username: str = None, password: str = None):
 # ============================================================
 
 async def buka_form_daftar_baru(page: Page):
-    # 0. Cek apakah pop up overlay z-20 aktif (menandakan form aktif/terbuka)
+    # 0. Cek jika url bukan halaman form pendaftaran, navigasikan langsung ke form untuk mempercepat proses (menghindari delay menu clicks)
+    if "ckg-pendaftaran-individu" not in page.url:
+        log("  🌐 Menavigasi langsung ke form pendaftaran CKG...", "INFO")
+        try:
+            await page.goto(f"{BASE_URL}/ckg-pendaftaran-individu", wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(1000)
+        except Exception as e:
+            log(f"  ⚠️ Gagal navigasi langsung ke form: {e}. Mencoba menu fallback...", "WARN")
+
+    # 1. Cek apakah pop up overlay z-20 aktif (menandakan form aktif/terbuka)
     xpath_overlay_z20 = (
         "//div[@id='__nuxt']/main/div[@class='h-full min-h-screen w-full  lt-md:block']"
         "/div[@class='h-auto overflow-hidden bg-white']/section[@class='relative ml-64 h-full min-h-screen overflow-hidden lt-md:ml-0 lt-md:w-full']"
@@ -735,7 +1082,7 @@ async def buka_form_daftar_baru(page: Page):
     except Exception:
         pass
 
-    # 1. Cek apakah form sudah terbuka (misal input NIK sudah terlihat)
+    # 2. Cek apakah form sudah terbuka (misal input NIK sudah terlihat)
     try:
         nik_input = page.get_by_role("textbox", name="NIK *")
         if await nik_input.is_visible(timeout=1500):
@@ -744,7 +1091,7 @@ async def buka_form_daftar_baru(page: Page):
     except Exception:
         pass
 
-    # 2. Cek apakah tombol 'Daftar Baru' terlihat di halaman (tanpa perlu klik menu CKG Umum)
+    # 3. Cek apakah tombol 'Daftar Baru' terlihat di halaman (tanpa perlu klik menu CKG Umum)
     try:
         daftar_baru_btn = page.get_by_role("button", name="Daftar Baru")
         if await daftar_baru_btn.is_visible(timeout=1500):
@@ -755,14 +1102,18 @@ async def buka_form_daftar_baru(page: Page):
     except Exception:
         pass
 
-    # 3. Fallback: Navigasi penuh dari menu
+    # 4. Fallback: Navigasi penuh dari menu
     log("Navigasi ke form CKG Umum → Daftar Baru…", "BOT")
-    await page.get_by_role("button", name="CKG Umum").click()
-    await page.wait_for_timeout(800)
-    await page.locator('[id="menu_cari/daftarkan_individu"]').click()
-    await page.wait_for_timeout(800)
-    await page.get_by_role("button", name="Daftar Baru").click()
-    await page.wait_for_timeout(1000)
+    try:
+        await page.get_by_role("button", name="CKG Umum").click()
+        await page.wait_for_timeout(800)
+        await page.locator('[id="menu_cari/daftarkan_individu"]').click()
+        await page.wait_for_timeout(800)
+        await page.get_by_role("button", name="Daftar Baru").click()
+        await page.wait_for_timeout(1000)
+    except Exception as e:
+        log(f"  ⚠️ Gagal navigasi menu fallback: {e}", "ERR")
+        raise e
 
 
 # ============================================================
@@ -990,11 +1341,16 @@ async def pilih_tanggal_wali(page: Page, tahun: int, bulan: int, hari: int):
 
 
 async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
+    check_stop_request()
     """
     Kembalikan: 'ok' | 'skip' | 'quit'
     """
     nama  = str(row.get("Nama Lengkap", "")).strip()
-    nik   = str(int(row.get("NIK", 0))).zfill(16)
+    # Parsing NIK secara aman untuk menghindari hilangnya digit ke-16 akibat floating-point precision
+    nik_raw = str(row.get("NIK", "")).strip()
+    if nik_raw.endswith(".0"):
+        nik_raw = nik_raw[:-2]
+    nik = "".join(re.findall(r"\d+", nik_raw)).zfill(16)
     jk    = str(row.get("Jenis Kelamin", "")).strip().upper()
     tgl   = pd.Timestamp(row.get("Tanggal Lahir"))
     no_hp = str(row.get("No HP", "")).strip()
@@ -1106,13 +1462,21 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
     # ── Cek Popup "Data Ditemukan" ────────────────────────────
     data_ditemukan = False
     try:
-        popup_txt = page.locator("div.text-black", has_text="Data Peserta ditemukan").first
-        if await popup_txt.count() == 0:
-            popup_txt = page.get_by_text("Data Peserta ditemukan").first
-        if await popup_txt.count() == 0:
-            popup_txt = page.locator(f"xpath={xpath_txt_data_ditemukan}").first
+        # Polling selama maks 3 detik untuk memberi waktu popup selesai loading/animasi
+        popup_txt = None
+        for _ in range(15):
+            loc = page.locator("div.text-black, h2, h3, div, p", has_text="Data Peserta ditemukan").first
+            if await loc.count() == 0:
+                loc = page.get_by_text("Data Peserta ditemukan").first
+            if await loc.count() == 0:
+                loc = page.locator(f"xpath={xpath_txt_data_ditemukan}").first
+                
+            if await loc.count() > 0 and await is_element_really_visible(loc):
+                popup_txt = loc
+                break
+            await page.wait_for_timeout(200)
             
-        if await is_element_really_visible(popup_txt):
+        if popup_txt:
             log("  ✓ Popup 'Data Peserta ditemukan' terdeteksi. Menggunakan data terdaftar...", "OK")
             # Cek tombol Gunakan Data
             btn_gunakan = page.get_by_role("button", name="Gunakan Data").first
@@ -1121,7 +1485,11 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
             if await btn_gunakan.count() == 0:
                 btn_gunakan = page.locator(f"xpath={xpath_btn_gunakan_data}").first
             
-            await btn_gunakan.click()
+            try:
+                await btn_gunakan.click(timeout=3000)
+            except Exception:
+                await js_click(btn_gunakan)
+                
             log("  ✓ Tombol 'Gunakan Data' diklik.", "OK")
             await page.wait_for_timeout(500)
             data_ditemukan = True
@@ -1202,7 +1570,14 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
         await page.wait_for_timeout(200)
 
         # ── No. WhatsApp ──────────────────────────────────────────
-        whatsapp_val = "881027381397"
+        # Gunakan nomor HP dari Excel jika ada, jika tidak gunakan nomor HP default dari GUI
+        whatsapp_val = no_hp
+        if not whatsapp_val and GUI_BRIDGE_ACTIVE and gui_bridge:
+            whatsapp_val = getattr(gui_bridge, "default_phone", "")
+            
+        if not whatsapp_val:
+            whatsapp_val = "" # Fallback default (kosong)
+            
         log(f"  ✏️  Mengisi No. WhatsApp: {whatsapp_val}", "BOT")
         try:
             whatsapp_input = page.locator("xpath=//input[@id='No Whatsapp']")
@@ -1293,14 +1668,31 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
             log(f"    ⚠️ Gagal memuat daftar baris di atas: {ex_list}", "WARN")
 
         # Konfirmasi nomor baris excel untuk data wali
-        print()
-        print("  ╔══════════════════════════════════════════╗")
-        print("  ║               ISI DATA WALI              ║")
-        print("  ╠══════════════════════════════════════════╣")
-        print(f"  ║  Pasien Saat Ini: No. {no_excel} (Baris Excel: {excel_row_current})")
-        print(f"  ║  Nama           : {nama}")
-        print("  ╚══════════════════════════════════════════╝")
-        row_target_input = input(f"  >> Masukkan No. baris pasien di Excel (kolom 'No') untuk dijadikan Wali [Default: {no_excel}]: ").strip()
+        if GUI_BRIDGE_ACTIVE and gui_bridge:
+            above_rows_data = []
+            try:
+                for idx, r_above in above_rows.iterrows():
+                    above_rows_data.append({
+                        "excel_row": idx + 2,
+                        "no": int(r_above['No']) if pd.notna(r_above['No']) else r_above['No'],
+                        "nama": str(r_above['Nama Lengkap']).strip()
+                    })
+            except Exception:
+                pass
+            row_target_input = gui_bridge.request_input("wali", {
+                "no_excel": no_excel,
+                "nama": nama,
+                "above_rows": above_rows_data
+            })
+        else:
+            print()
+            print("  ╔══════════════════════════════════════════╗")
+            print("  ║               ISI DATA WALI              ║")
+            print("  ╠══════════════════════════════════════════╣")
+            print(f"  ║  Pasien Saat Ini: No. {no_excel} (Baris Excel: {excel_row_current})")
+            print(f"  ║  Nama           : {nama}")
+            print("  ╚══════════════════════════════════════════╝")
+            row_target_input = input(f"  >> Masukkan No. baris pasien di Excel (kolom 'No') untuk dijadikan Wali [Default: {no_excel}]: ").strip()
 
         target_no = no_excel
         if row_target_input:
@@ -1318,16 +1710,17 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
 
         if target_no != no_excel:
             try:
-                temp_df = pd.read_excel(FILE_EXCEL, usecols=[0, 1, 2, 3, 5])
+                temp_df = pd.read_excel(FILE_EXCEL, usecols=[0, 1, 2, 3, 5], dtype={2: str})
                 temp_df.columns = ["No", "Nama Lengkap", "NIK", "Jenis Kelamin", "Tanggal Lahir"]
                 matched_rows = temp_df[temp_df["No"] == target_no]
                 if not matched_rows.empty:
                     target_row_data = matched_rows.iloc[0]
                     wali_nama = str(target_row_data["Nama Lengkap"]).strip()
-                    try:
-                        wali_nik = str(int(target_row_data["NIK"])).zfill(16)
-                    except Exception:
-                        wali_nik = str(target_row_data["NIK"]).strip().zfill(16)
+                    # Parsing Wali NIK secara aman
+                    wali_nik_raw = str(target_row_data["NIK"]).strip()
+                    if wali_nik_raw.endswith(".0"):
+                        wali_nik_raw = wali_nik_raw[:-2]
+                    wali_nik = "".join(re.findall(r"\d+", wali_nik_raw)).zfill(16)
                     wali_jk   = str(target_row_data["Jenis Kelamin"]).strip().upper()
                     wali_tgl  = pd.Timestamp(target_row_data["Tanggal Lahir"])
                     log(f"    👉 Menggunakan data No. {target_no} ({wali_nama}) sebagai Wali", "OK")
@@ -1471,7 +1864,7 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
                 await page.locator(f"xpath={xpath_btn_selanjutnya_step1}").first.click(timeout=3000)
             except Exception:
                 await page.get_by_role("button", name="Selanjutnya").click(timeout=5000)
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(100)
             
             # Cek popup tidak valid
             if await cek_popup_tidak_valid(page):
@@ -1480,7 +1873,15 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
 
             # Tangani popup Kuota Pemeriksaan Habis setelah submit
             await klik_popup_kuota(page)
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(200)
+            
+            # Cek jika tombol Selanjutnya sudah tidak terlihat (halaman berhasil berpindah)
+            btn_sel_xpath = page.locator(f"xpath={xpath_btn_selanjutnya_step1}").first
+            btn_sel_role = page.get_by_role("button", name="Selanjutnya").first
+            
+            if not (await btn_sel_xpath.is_visible()) and not (await btn_sel_role.is_visible()):
+                log("  ✓ Berhasil submit Step 1 (halaman berpindah).", "OK")
+                break
         except SkipPasien:
             raise
         except Exception:
@@ -1560,12 +1961,78 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
             
             modal_terbuka = False
             card_modal = None
-            for _ in range(30):  # 30 * 200ms = 6 detik max wait
+            for _ in range(60):  # 60 * 200ms = 12 detik max wait (lebih lama karena kuota bisa lambat)
+                # 1. Pastikan popup kuota sudah benar-benar hilang sebelum memeriksa modal
+                try:
+                    btn_pilih_lain = page.locator("button").filter(
+                        has_text=re.compile(r"Pilih Tanggal Lain", re.IGNORECASE)
+                    ).first
+                    if await btn_pilih_lain.is_visible():
+                        # Popup kuota MASIH ada — coba tutup sekali lagi
+                        await klik_popup_kuota(page)
+                        await page.wait_for_timeout(500)
+                        continue
+                except Exception:
+                    pass
+
+                # 2. Cek jika popup 'Data peserta valid' masih terbuka, klik 'Lanjutkan'
+                try:
+                    popup_peserta_valid = page.locator("div.fixed.z-1000, div.fixed.z-1100, div[class*='z-1000'], div[class*='z-1100']").filter(
+                        has_text=re.compile(r"Data peserta valid", re.IGNORECASE)
+                    ).first
+                    if await popup_peserta_valid.count() > 0 and await popup_peserta_valid.is_visible():
+                        log("  ⚠️  Popup 'Data peserta valid' terdeteksi masih terbuka di loop modal. Mengeklik Lanjutkan...", "WARN")
+                        btn_lanjutkan = popup_peserta_valid.locator("button, [role='button'], div.cursor-pointer").filter(
+                            has_text=re.compile(r"Lanjutkan", re.IGNORECASE)
+                        ).first
+                        if await btn_lanjutkan.count() > 0 and await btn_lanjutkan.is_visible():
+                            if not await force_js_click(btn_lanjutkan):
+                                await btn_lanjutkan.click(timeout=2000)
+                        else:
+                            btn_any = popup_peserta_valid.locator("button, [role='button'], div.cursor-pointer").first
+                            if await btn_any.count() > 0:
+                                await force_js_click(btn_any)
+                        await page.wait_for_timeout(500)
+                        continue
+                except Exception:
+                    pass
+
+                # 3. Cek jika popup 'Data peserta tidak valid' masih terbuka, klik 'Periksa Kembali' dan skip pasien
+                try:
+                    popup_peserta_tidak_valid = page.locator("div.fixed.z-1000, div.fixed.z-1100, div[class*='z-1000'], div[class*='z-1100']").filter(
+                        has_text=re.compile(r"Data peserta tidak valid", re.IGNORECASE)
+                    ).first
+                    if await popup_peserta_tidak_valid.count() > 0 and await popup_peserta_tidak_valid.is_visible():
+                        log("  ⚠️  Popup 'Data peserta tidak valid' terdeteksi terbuka di loop modal. Mengeklik Periksa Kembali dan men-skip pasien...", "WARN")
+                        btn_periksa = popup_peserta_tidak_valid.locator("button, [role='button'], div.cursor-pointer").filter(
+                            has_text=re.compile(r"(Periksa|Tutup|Kembali|OK)", re.IGNORECASE)
+                        ).first
+                        if await btn_periksa.count() > 0 and await btn_periksa.is_visible():
+                            if not await force_js_click(btn_periksa):
+                                await btn_periksa.click(timeout=2000)
+                        else:
+                            btn_any = popup_peserta_tidak_valid.locator("button, [role='button'], div.cursor-pointer").first
+                            if await btn_any.count() > 0:
+                                await force_js_click(btn_any)
+                        await page.wait_for_timeout(500)
+                        raise SkipPasien("Kategori pasien dilewati (data tidak valid terdeteksi di loop modal)")
+                except SkipPasien:
+                    raise
+                except Exception:
+                    pass
+
                 # Cek jika modal data pendukung terlihat
+                # Gunakan keyword yang UNIK untuk modal data pendukung:
+                # 'status pernikahan' + 'pekerjaan' + 'alamat domisili' — tidak ada di popup kuota
                 possible_card = page.locator("div.fixed.z-1000 div.rounded-lg.bg-white, div.fixed.z-1100 div.rounded-lg.bg-white").first
                 if await is_element_really_visible(possible_card):
                     text = await possible_card.inner_text()
-                    if "status pernikahan" in text.lower() or "data peserta" in text.lower():
+                    text_lower = text.lower()
+                    # Harus mengandung 'status pernikahan' DAN ('pekerjaan' ATAU 'alamat')
+                    # Ini sangat spesifik untuk modal data pendukung, tidak akan cocok dengan popup kuota
+                    has_pernikahan = "status pernikahan" in text_lower
+                    has_form_fields = "pekerjaan" in text_lower or "alamat domisili" in text_lower
+                    if has_pernikahan and has_form_fields:
                         modal_terbuka = True
                         card_modal = possible_card
                         break
@@ -1719,29 +2186,197 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
                         pass
                 await page.wait_for_timeout(400)
 
-                # 4. Alamat Domisili (Kolom J) — Input Manual oleh User
+                # 4. Alamat Domisili (Kolom J) — Pengisian Otomatis Cascading (Provinsi > Kabupaten > Kecamatan > Kelurahan)
                 alamat_domisili = str(row.get("Alamat Domisili", "")).strip()
                 log(f"  ✏️  Alamat Domisili: {alamat_domisili}", "BOT")
                 field_domisili = await get_modal_field("Alamat Domisili", xpath_domisili)
                 await js_click(field_domisili)
                 await page.wait_for_timeout(800)
 
-                # Tampilkan data alamat ke terminal, user isi manual di browser
-                print()
-                print("  ╔══════════════════════════════════════════╗")
-                print("  ║         ISI ALAMAT DOMISILI MANUAL       ║")
-                print("  ╠══════════════════════════════════════════╣")
                 parts = [p.strip() for p in alamat_domisili.split(",")]
                 desa_val = parts[0] if len(parts) > 0 else "-"
                 kec_val  = parts[1] if len(parts) > 1 else "-"
                 kab_val  = parts[2] if len(parts) > 2 else "-"
                 prov_val = parts[3] if len(parts) > 3 else "-"
-                print(f"  ║  Provinsi       : {prov_val}")
-                print(f"  ║  Kabupaten/Kota : {kab_val}")
-                print(f"  ║  Kecamatan      : {kec_val}")
-                print(f"  ║  Desa/Kelurahan : {desa_val}")
-                print("  ╚══════════════════════════════════════════╝")
-                input("  >> Setelah selesai isi alamat di browser, tekan ENTER untuk lanjut... ")
+                
+                # Coba pengisian alamat secara otomatis dengan tahapan Provinsi > Kabupaten > Kecamatan > Kelurahan
+                success_auto_address = False
+                try:
+                    stages = [
+                        {"name": "Provinsi", "val": prov_val, "index": 0},
+                        {"name": "Kabupaten", "val": kab_val, "index": 1},
+                        {"name": "Kecamatan", "val": kec_val, "index": 2},
+                        {"name": "Kelurahan", "val": desa_val, "index": 3}
+                    ]
+                    
+                    log("  🤖 Memulai pengisian alamat otomatis secara berjenjang...", "BOT")
+                    
+                    completed_stages = 0
+                    for stage in stages:
+                        check_stop_request()
+                        name = stage["name"]
+                        val = stage["val"]
+                        idx = stage["index"]
+                        
+                        if val == "-":
+                            log(f"    ⚠️ Nilai untuk {name} tidak valid, melewati otomatisasi.", "WARN")
+                            break
+                            
+                        log(f"    ⏳ Memproses {name}: '{val}'...", "WAIT")
+                        
+                        # 1. Cari input pencarian untuk tahap ini
+                        # KUNCI: Overlay menampilkan 1 input sekaligus secara bergantian (cascade):
+                        # Provinsi → (setelah dipilih) → Kabupaten → Kecamatan → Kelurahan
+                        # Jadi selalu cari input PERTAMA (first) yang visible di overlay, bukan nth(idx)
+                        search_input = None
+                        
+                        # Tunggu input overlay muncul (hingga 3 detik)
+                        for _wait in range(15):  # 15 * 200ms = 3 detik
+                            locators_search = [
+                                page.locator(f"xpath=/html/body/div[3]/div[2]/div[{idx + 1}]/input"),
+                                page.locator("div.fixed.z-9000 input").first,
+                                page.locator("div[class*='z-9000'] input").first,
+                            ]
+                            for loc in locators_search:
+                                try:
+                                    if await loc.count() > 0 and await is_element_really_visible(loc.first):
+                                        search_input = loc.first
+                                        break
+                                except Exception:
+                                    pass
+                            if search_input:
+                                break
+                            await page.wait_for_timeout(200)
+                                
+                        if not search_input:
+                            log(f"    ⚠️ Kolom input {name} tidak ditemukan atau belum aktif.", "WARN")
+                            break
+                            
+                        # 2. Klik, fokus, isi input dan kirim ketikan
+                        log(f"      🤖 Mengisi {name} dengan: '{val}'...", "BOT")
+                        await js_click(search_input)
+                        await page.wait_for_timeout(300)
+                        await search_input.fill("")
+                        await search_input.type(val, delay=80)
+                        # 3. Cari dan klik item hasil pencarian yang cocok (dengan polling hingga 3.6 detik)
+                        stage_clicked = False
+                        
+                        log(f"      ⏳ Menunggu opsi pencarian untuk {name} muncul...", "WAIT")
+                        for _search_wait in range(18):  # 18 * 200ms = 3.6 detik max wait
+                            # LAPISAN 1: Cari opsi secara langsung menggunakan locator teks di dalam overlay z-9000
+                            try:
+                                # Cari di elemen list/button/div di dalam overlay yang mengandung teks target
+                                opt_locators = [
+                                    page.locator("div.fixed.z-9000, div[class*='z-9000']").locator("li, button, [role='option'], div.cursor-pointer").get_by_text(val, exact=False),
+                                    page.locator("div.fixed.z-9000, div[class*='z-9000']").locator("div").get_by_text(val, exact=False)
+                                ]
+                                
+                                for loc in opt_locators:
+                                    cnt = await loc.count()
+                                    for i in range(cnt):
+                                        opt = loc.nth(i)
+                                        if await opt.is_visible():
+                                            text = (await opt.text_content() or "").strip()
+                                            # Hindari container besar (teks > 100 karakter)
+                                            if not text or len(text) < 2 or len(text) > 100:
+                                                continue
+                                            # Filter kata pencarian fiktif
+                                            if "pencarian" in text.lower() or "cari" in text.lower() or "pilih" in text.lower():
+                                                continue
+                                            
+                                            log(f"      ✓ Menemukan opsi '{text}' untuk {name} (Lapis 1)", "OK")
+                                            if not await force_js_click(opt):
+                                                await opt.click(timeout=2000)
+                                            stage_clicked = True
+                                            break
+                                    if stage_clicked:
+                                        break
+                            except Exception:
+                                pass
+                                
+                            if stage_clicked:
+                                break
+                            await page.wait_for_timeout(200)
+
+                        # LAPISAN 2: Scan manual semua elemen di z-9000 (jika lapis 1 gagal)
+                        if not stage_clicked:
+                            try:
+                                overlay_opts = page.locator("div.fixed.z-9000 div, div.fixed.z-9000 li, div.fixed.z-9000 span, div.fixed.z-9000 p")
+                                for i in range(await overlay_opts.count()):
+                                    opt = overlay_opts.nth(i)
+                                    if await opt.is_visible():
+                                        is_input = await opt.evaluate("el => ['INPUT','TEXTAREA','SELECT'].includes(el.tagName)")
+                                        if is_input:
+                                            continue
+                                            
+                                        text = (await opt.text_content() or "").strip()
+                                        if not text or len(text) < 2 or len(text) > 80:
+                                            continue
+                                        if "pencarian" in text.lower() or "cari" in text.lower() or "pilih" in text.lower():
+                                            continue
+                                            
+                                        if val.lower() in text.lower() or text.lower() in val.lower():
+                                            log(f"      ✓ Menemukan opsi '{text}' untuk {name} (Lapis 2)", "OK")
+                                            if not await force_js_click(opt):
+                                                await opt.click(timeout=2000)
+                                            stage_clicked = True
+                                            break
+                            except Exception as ex_l2:
+                                log(f"      ⚠️ Gagal memindai z-9000 overlay: {ex_l2}", "WARN")
+                                
+                        # LAPISAN 3: Keyboard Fallback (ArrowDown + Enter)
+                        if not stage_clicked:
+                            log(f"      ⌨️ Keyboard fallback untuk {name}...", "INFO")
+                            try:
+                                await search_input.press("ArrowDown")
+                                await page.wait_for_timeout(300)
+                                await search_input.press("Enter")
+                                await page.wait_for_timeout(500)
+                                stage_clicked = True
+                                log(f"      ✓ Berhasil memilih {name} via keyboard.", "OK")
+                            except Exception as ex_key:
+                                check_stop_request()
+                                log(f"      ⚠️ Gagal memilih {name} via keyboard: {ex_key}", "WARN")
+                                
+                        if not stage_clicked:
+                            log(f"    ❌ Gagal memilih opsi untuk {name}.", "ERR")
+                            break
+                            
+                        completed_stages += 1
+                        await page.wait_for_timeout(1200)  # jeda agar overlay stage berikutnya render
+
+                        
+                    if completed_stages == 4:
+                        log("  ✓ Seluruh tahapan alamat (Provinsi > Kabupaten > Kecamatan > Kelurahan) berhasil diisi otomatis.", "OK")
+                        success_auto_address = True
+                    else:
+                        log(f"  ⚠️ Hanya berhasil mengisi {completed_stages}/4 tahapan alamat. Beralih ke mode manual.", "WARN")
+                        
+                except Exception as ex_addr:
+                    check_stop_request()
+                    log(f"  ⚠️ Gagal melakukan pengisian alamat otomatis berjenjang: {ex_addr}", "WARN")
+
+                # Jika pengisian otomatis gagal, tampilkan petunjuk pengisian manual
+                check_stop_request()
+                if not success_auto_address:
+                    if GUI_BRIDGE_ACTIVE and gui_bridge:
+                        gui_bridge.request_input("manual_address", {
+                            "provinsi": prov_val,
+                            "kabupaten": kab_val,
+                            "kecamatan": kec_val,
+                            "kelurahan": desa_val
+                        })
+                    else:
+                        print()
+                        print("  ╔══════════════════════════════════════════╗")
+                        print("  ║         ISI ALAMAT DOMISILI MANUAL       ║")
+                        print("  ╠══════════════════════════════════════════╣")
+                        print(f"  ║  Provinsi       : {prov_val}")
+                        print(f"  ║  Kabupaten/Kota : {kab_val}")
+                        print(f"  ║  Kecamatan      : {kec_val}")
+                        print(f"  ║  Desa/Kelurahan : {desa_val}")
+                        print("  ╚══════════════════════════════════════════╝")
+                        input("  >> Setelah selesai isi alamat di browser, tekan ENTER untuk lanjut... ")
 
                 # Konfirmasi/Simpan pilihan alamat domisili jika ada tombol konfirmasi
                 log("    ⏳ Mengklik tombol konfirmasi/pilih alamat...", "WAIT")
@@ -1755,7 +2390,7 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
                     has_text=re.compile(r"^(Pilih|Simpan|Terapkan|Tutup|Konfirmasi)$", re.IGNORECASE)
                 ).first
                 
-                if await btn_konfirmasi_domisili.count() > 0 and await is_element_really_visible(btn_konfirmasi_domisili):
+                if await btn_konfirmasi_domisili.count() > 0 and await btn_konfirmasi_domisili.is_visible():
                     await js_click(btn_konfirmasi_domisili)
                 else:
                     btn_alt = page.locator("div.modal-content button").last
@@ -2057,17 +2692,25 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
         print("\n  ⚠️⚠️⚠️ WARNING: DATA TIDAK VALID TERDETEKSI! ⚠️⚠️⚠️")
         print("  Silakan ketik [2] atau langsung tekan ENTER untuk SKIP pasien ini dan lanjut ke baris berikutnya.")
 
-    print("\n  >> Tentukan status pasien ini di Excel:")
-    print("     [1] Lolos (Hijau - Berhasil)")
-    print("     [2] Skip  (Kuning - Lewati)")
-    print("     [3] Gagal (Merah - Error/Gagal)")
-    print("     [r] Ulangi (Reload & Ulangi baris ini)")
-    print("     [q] Berhenti (Quit)")
-    
     default_pilihan = "2" if data_tidak_valid else "1"
-    pilihan = input(f"  >> Masukkan pilihan [1/2/3/r/q, default: {default_pilihan}]: ").strip().lower()
-    if pilihan == "":
-        pilihan = default_pilihan
+    if GUI_BRIDGE_ACTIVE and gui_bridge:
+        pilihan = gui_bridge.request_input("decision", {
+            "nomor": nomor,
+            "nama": nama,
+            "data_tidak_valid": data_tidak_valid,
+            "default_pilihan": default_pilihan
+        })
+    else:
+        print("\n  >> Tentukan status pasien ini di Excel:")
+        print("     [1] Lolos (Hijau - Berhasil)")
+        print("     [2] Skip  (Kuning - Lewati)")
+        print("     [3] Gagal (Merah - Error/Gagal)")
+        print("     [r] Ulangi (Reload & Ulangi baris ini)")
+        print("     [q] Berhenti (Quit)")
+        
+        pilihan = input(f"  >> Masukkan pilihan [1/2/3/r/q, default: {default_pilihan}]: ").strip().lower()
+        if pilihan == "":
+            pilihan = default_pilihan
 
     if pilihan == "2":
         return "skip"
@@ -2085,24 +2728,35 @@ async def input_pasien(page: Page, row: dict, nomor: int, total: int) -> str:
 #  MAIN — satu data contoh
 # ============================================================
 
-async def main():
+async def main(username_arg=None, password_arg=None, mulai_baris_arg=None, excel_file_arg=None, headless_arg=None):
+    global FILE_EXCEL, HEADLESS
+    
+    if excel_file_arg:
+        FILE_EXCEL = Path(excel_file_arg)
+    if headless_arg is not None:
+        HEADLESS = headless_arg
+        
     print()
     print(f"  {GARIS2}")
-    print(f"  🤖 Bot Batch CKG — sehatindonesiaku.kemkes.go.id")
+    print(f"  🤖 Arzachel Bot CKG — sehatindonesiaku.kemkes.go.id")
     print(f"  {GARIS2}")
     print()
 
     # ── Pilihan Login ────────────────────────────────────────
-    print("  === PILIHAN LOGIN ===")
-    print("  [1] Gunakan username & password default")
-    print("  [2] Masukkan username & password lain")
-    pilihan_login = input("  >> Masukkan pilihan [1/2, default: 1]: ").strip()
-    
-    username_input = None
-    password_input = None
-    if pilihan_login == "2":
-        username_input = input("  >> Masukkan Email: ").strip()
-        password_input = input("  >> Masukkan Kata sandi: ").strip()
+    if username_arg is not None and password_arg is not None:
+        username_input = username_arg
+        password_input = password_arg
+    else:
+        print("  === PILIHAN LOGIN ===")
+        print("  [1] Gunakan username & password default")
+        print("  [2] Masukkan username & password lain")
+        pilihan_login = input("  >> Masukkan pilihan [1/2, default: 1]: ").strip()
+        
+        username_input = None
+        password_input = None
+        if pilihan_login == "2":
+            username_input = input("  >> Masukkan Email: ").strip()
+            password_input = input("  >> Masukkan Kata sandi: ").strip()
 
     # ── Baca Excel & Deteksi Baris Terakhir ──────────────────
     if not FILE_EXCEL.exists():
@@ -2124,18 +2778,21 @@ async def main():
         log("Belum ada data yang ditandai diproses di Excel.", "INFO")
         suggested_start = 1
 
-    mulai_baris_str = input(f"  >> Mulai dari No. berapa di Excel? [Default: {suggested_start}]: ").strip()
-    if mulai_baris_str == "":
-        mulai_baris = suggested_start
+    if mulai_baris_arg is not None:
+        mulai_baris = mulai_baris_arg
     else:
-        try:
-            mulai_baris = int(mulai_baris_str)
-        except ValueError:
+        mulai_baris_str = input(f"  >> Mulai dari No. berapa di Excel? [Default: {suggested_start}]: ").strip()
+        if mulai_baris_str == "":
             mulai_baris = suggested_start
-            log(f"Pilihan tidak valid, menggunakan default: {mulai_baris}", "WARN")
+        else:
+            try:
+                mulai_baris = int(mulai_baris_str)
+            except ValueError:
+                mulai_baris = suggested_start
+                log(f"Pilihan tidak valid, menggunakan default: {mulai_baris}", "WARN")
 
     # Baca Excel, ambil kolom No, Nama Lengkap, NIK, Jenis Kelamin, Tanggal Lahir, Status Perkawinan, Pekerjaan, Alamat, Alamat Domisili
-    df = pd.read_excel(FILE_EXCEL, usecols=[0, 1, 2, 3, 5, 6, 7, 8, 9])
+    df = pd.read_excel(FILE_EXCEL, usecols=[0, 1, 2, 3, 5, 6, 7, 8, 9], dtype={2: str})
     df.columns = ["No", "Nama Lengkap", "NIK", "Jenis Kelamin", "Tanggal Lahir", "Status Pernikahan", "Pekerjaan", "Detail Domisili", "Alamat Domisili"]
     df = df.dropna(subset=["NIK"])          # hapus baris kosong
     df = df[df["No"] >= mulai_baris]        # resume dari baris tertentu
@@ -2150,7 +2807,11 @@ async def main():
 
     # Preview 3 baris pertama
     for _, r in df.head(3).iterrows():
-        nik = str(int(r["NIK"])).zfill(16)
+        # Parsing NIK secara aman untuk preview
+        nik_raw = str(r["NIK"]).strip()
+        if nik_raw.endswith(".0"):
+            nik_raw = nik_raw[:-2]
+        nik = "".join(re.findall(r"\d+", nik_raw)).zfill(16)
         tgl = pd.Timestamp(r["Tanggal Lahir"]).strftime("%d-%m-%Y")
         log(f"  No.{int(r['No']):>2} | {r['Nama Lengkap']:<30} | {nik} | {r['Jenis Kelamin']} | {tgl}", "INFO")
     if total > 3:
@@ -2173,7 +2834,14 @@ async def main():
             ),
         )
         page: Page = await context.new_page()
-        page.set_default_timeout(TIMEOUT)
+        page.set_default_navigation_timeout(30000)
+        page.set_default_timeout(8000)
+        
+        global current_page
+        current_page = page
+        
+        # Jalankan background task untuk memantau sinyal stop/skip dari GUI
+        asyncio.create_task(poll_gui_signals())
 
         berhasil  = 0
         gagal     = 0
@@ -2190,11 +2858,25 @@ async def main():
 
             # ── Loop semua pasien ─────────────────────────────
             for urutan, (_, baris) in enumerate(df.iterrows(), start=1):
+                check_stop_request()
                 nomor = int(baris["No"])
                 nama  = str(baris["Nama Lengkap"]).strip()
                 status_pasien = None
                 break_outer = False
+                excel_sudah_ditulis = False  # flag untuk mencegah double-write ke Excel
                 while True:
+                    if page.is_closed():
+                        log("  🌐 Membuat halaman browser baru untuk melanjutkan...", "INFO")
+                        page = await context.new_page()
+                        current_page = page
+                        page.set_default_navigation_timeout(30000)
+                        page.set_default_timeout(8000)
+                        try:
+                            await page.goto(BASE_URL, wait_until="domcontentloaded")
+                        except Exception as eg:
+                            log(f"  ⚠️ Gagal navigasi ke halaman utama: {eg}", "WARN")
+                            
+                    check_stop_request()
                     try:
                         # Cek sesi sebelum tiap pasien — auto relogin jika expired
                         await cek_sesi_berakhir(page, username=username_input, password=password_input)
@@ -2202,13 +2884,18 @@ async def main():
                         # Buka form Daftar Baru setiap iterasi
                         await buka_form_daftar_baru(page)
 
-                        # Input data pasien
-                        hasil = await input_pasien(
-                            page,
-                            baris.to_dict(),
-                            urutan,
-                            total,
+                        # Bungkus input_pasien dalam asyncio.Task agar bisa di-cancel
+                        # oleh poll_gui_signals saat user menekan tombol Skip.
+                        # asyncio.CancelledError TIDAK tertangkap oleh except Exception,
+                        # sehingga skip selalu berhasil terlepas dari try-except lokal
+                        # di dalam input_pasien.
+                        global _current_input_task
+                        _current_input_task = asyncio.ensure_future(
+                            input_pasien(page, baris.to_dict(), urutan, total)
                         )
+                        hasil = await _current_input_task
+                        _current_input_task = None
+
                         if hasil == "ok":
                             status_pasien = "berhasil"
                         elif hasil == "quit_success":
@@ -2229,52 +2916,152 @@ async def main():
                             break_outer = True
                             break
 
+                    except StopBotException:
+                        status_pasien = "quit"
+                        break_outer = True
+                        break
+
                     except SkipPasien as sp:
                         status_pasien = "dilewati"
                         log(f"  ⏭  Skip [{nomor}] {nama}: {sp}", "WARN")
                         await screenshot(page, f"skip_{nomor}_{nama[:10].replace(' ','_')}")
+                        break
+
+                    except asyncio.CancelledError:
+                        # Skip ditekan user via tombol GUI — ini jalur utama skip yang pasti berhasil.
+                        # CancelledError tidak bisa ditangkap oleh except Exception di mana pun.
+                        _current_input_task = None
+                        if gui_bridge:
+                            gui_bridge.skip_active = False
+                        status_pasien = "dilewati"
+                        dilewati += 1
+                        excel_sudah_ditulis = True  # tandai agar post-loop tidak double-write
+                        log(f"  ⏭  Skip [{nomor}] {nama}: Tombol Skip ditekan oleh user.", "WARN")
+                        update_excel_row_color(nomor, "yellow")
+                        # Buka form baru agar browser sudah siap untuk pasien berikutnya
+                        try:
+                            if not page.is_closed():
+                                await buka_form_daftar_baru(page)
+                        except Exception:
+                            pass
+                        break_outer = False
+                        break
 
                     except Exception as e:
-                        status_pasien = "gagal"
+                        # Cek apakah ini akibat request Stop atau Skip dari GUI
+                        if GUI_BRIDGE_ACTIVE and gui_bridge:
+                            if not gui_bridge.running:
+                                status_pasien = "quit"
+                                break_outer = True
+                                break
+                            if getattr(gui_bridge, "skip_requested", False) or getattr(gui_bridge, "skip_active", False):
+                                gui_bridge.skip_requested = False
+                                gui_bridge.skip_active = False
+                                status_pasien = "dilewati"
+                                log(f"  ⏭  Skip [{nomor}] {nama} (Skip diminta oleh user melalui GUI)", "WARN")
+                                break
+
+                        if "StopBotException" in str(type(e)):
+                            status_pasien = "quit"
+                            break_outer = True
+                            break
+                            
                         log(f"  ✗ Gagal [{nomor}] {nama}: {e}", "ERR")
                         await screenshot(page, f"error_{nomor}_{nama[:10].replace(' ','_')}")
+                        
+                        if GUI_BRIDGE_ACTIVE and gui_bridge:
+                            log("  ⚠️ Mengaktifkan Asisten Pintar: Meminta bantuan user untuk ambil kendali...", "WARN")
+                            pilihan = gui_bridge.request_input("take_control", {
+                                "nomor": nomor,
+                                "nama": nama,
+                                "error_msg": str(e)
+                            })
+                            if pilihan == "resume":
+                                log("  🔄 User meminta untuk melanjutkan pengisian otomatis (Resume)...", "WARN")
+                                # Lanjut tanpa reload halaman, langsung coba isi sisa field
+                                continue
+                            elif pilihan == "ulang":
+                                log("  🔄 User meminta untuk mengulangi baris ini dari awal. Mereload halaman...", "WARN")
+                                await page.reload()
+                                await page.wait_for_timeout(3000)
+                                continue
+                            elif pilihan == "ok" or pilihan == "berhasil":
+                                log("  ✓ User menandai pasien ini BERHASIL (Lolos) secara manual.", "OK")
+                                status_pasien = "berhasil"
+                                break
+                            elif pilihan == "skip":
+                                status_pasien = "dilewati"
+                                break
+                            elif pilihan == "gagal":
+                                status_pasien = "gagal"
+                                break
+                            elif pilihan == "quit":
+                                status_pasien = "quit"
+                                break_outer = True
+                                break
+                        else:
+                            break
 
                     # Jeda sebelum pasien berikutnya/reload
-                    await page.wait_for_timeout(JEDA_ANTAR_DATA)
+                    try:
+                        if not page.is_closed():
+                            await page.wait_for_timeout(JEDA_ANTAR_DATA)
+                    except Exception:
+                        pass
 
                     # Konfirmasi manual sebelum lanjut ke baris berikutnya
                     if urutan < total:
-                        pilihan_lanjut = input(f"\n  [Selesai Baris {nomor}] Tekan ENTER untuk lanjut ke pasien berikutnya, ketik 'r' untuk reload halaman & ulangi baris ini, atau 'q' untuk keluar: ").strip().lower()
-                        if pilihan_lanjut == "r":
-                            log("  🔄 User memilih reload halaman. Mereload halaman...", "WARN")
-                            await page.reload()
-                            await page.wait_for_timeout(3000)
-                            continue
-                        elif pilihan_lanjut == "q":
-                            log("Bot dihentikan oleh user.", "WARN")
-                            break_outer = True
-                            break
+                        if GUI_BRIDGE_ACTIVE and gui_bridge:
+                            if gui_bridge.auto_advance:
+                                break
+                            else:
+                                pilihan_lanjut = gui_bridge.request_input("next_patient_pause", nomor)
+                                if pilihan_lanjut == "r":
+                                    log("  🔄 User memilih reload halaman. Mereload halaman...", "WARN")
+                                    await page.reload()
+                                    await page.wait_for_timeout(3000)
+                                    continue
+                                elif pilihan_lanjut == "q":
+                                    log("Bot dihentikan oleh user.", "WARN")
+                                    break_outer = True
+                                    break
+                                else:
+                                    break
                         else:
-                            break
+                            pilihan_lanjut = input(f"\n  [Selesai Baris {nomor}] Tekan ENTER untuk lanjut ke pasien berikutnya, ketik 'r' untuk reload halaman & ulangi baris ini, atau 'q' untuk keluar: ").strip().lower()
+                            if pilihan_lanjut == "r":
+                                log("  🔄 User memilih reload halaman. Mereload halaman...", "WARN")
+                                await page.reload()
+                                await page.wait_for_timeout(3000)
+                                continue
+                            elif pilihan_lanjut == "q":
+                                log("Bot dihentikan oleh user.", "WARN")
+                                break_outer = True
+                                break
+                            else:
+                                break
                     else:
                         break
 
-                # Update status akhir dan excel setelah keluar dari loop retry
-                if status_pasien == "berhasil":
-                    berhasil += 1
-                    update_excel_row_color(nomor, "green")
-                elif status_pasien == "berhasil_quit":
-                    berhasil += 1
-                    update_excel_row_color(nomor, "green")
-                elif status_pasien == "dilewati":
-                    dilewati += 1
-                    update_excel_row_color(nomor, "yellow")
-                elif status_pasien == "gagal":
-                    gagal += 1
-                    update_excel_row_color(nomor, "red")
-                    gagal_list.append(f"No.{nomor} {nama}: Diproses Gagal/Error")
-                elif status_pasien == "quit":
-                    update_excel_row_color(nomor, "red")
+                # Update status akhir dan excel setelah keluar dari loop retry.
+                # Jalur CancelledError sudah menulis Excel dan menghitung statistik sendiri
+                # (excel_sudah_ditulis = True), sehingga blok ini dilewati untuk pasien tersebut.
+                if not excel_sudah_ditulis:
+                    if status_pasien == "berhasil":
+                        berhasil += 1
+                        update_excel_row_color(nomor, "green")
+                    elif status_pasien == "berhasil_quit":
+                        berhasil += 1
+                        update_excel_row_color(nomor, "green")
+                    elif status_pasien == "dilewati":
+                        dilewati += 1
+                        update_excel_row_color(nomor, "yellow")
+                    elif status_pasien == "gagal":
+                        gagal += 1
+                        update_excel_row_color(nomor, "red")
+                        gagal_list.append(f"No.{nomor} {nama}: Diproses Gagal/Error")
+                    elif status_pasien == "quit":
+                        update_excel_row_color(nomor, "red")
 
                 if break_outer:
                     break
@@ -2283,7 +3070,8 @@ async def main():
             log(f"Error fatal: {e}", "ERR")
             await screenshot(page, "error_fatal")
         finally:
-            input("\nTekan ENTER untuk menutup browser…")
+            if not GUI_BRIDGE_ACTIVE:
+                input("\nTekan ENTER untuk menutup browser…")
             await browser.close()
 
     # ── Laporan akhir ─────────────────────────────────────────

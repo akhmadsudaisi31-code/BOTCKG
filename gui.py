@@ -891,8 +891,8 @@ class BotGUI:
         if qris_path:
             try:
                 img_qris = Image.open(qris_path)
-                # Fit to 180x180 pixels nicely
-                img_qris = img_qris.resize((180, 180), Image.Resampling.LANCZOS)
+                # Fit to 260x260 pixels to make it larger and easier to scan
+                img_qris = img_qris.resize((260, 260), Image.Resampling.LANCZOS)
                 img_tk = ImageTk.PhotoImage(img_qris)
                 
                 qris_frame = tk.Frame(card, bg=self.c_bg, bd=1, relief="solid", highlightthickness=0)

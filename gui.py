@@ -50,16 +50,21 @@ class BotGUI:
         
         self.config_file = Path("gui_config.json")
         self.setup_styles()
-        self.build_ui()
         
-        # Initial check for Excel
-        self.auto_detect_excel()
+        # Check activation status
+        self.device_id = self.get_device_id()
+        self.is_activated = self.check_activation()
         
-        # Start periodic poller (50ms interval)
-        self.root.after(50, self.poll_queues)
-        
-        # Check for updates in background (1 second delay)
-        self.root.after(1000, self.check_for_updates)
+        if not self.is_activated:
+            self.build_activation_ui()
+        else:
+            self.build_ui()
+            # Initial check for Excel
+            self.auto_detect_excel()
+            # Start periodic poller (50ms interval)
+            self.root.after(50, self.poll_queues)
+            # Check for updates in background (1 second delay)
+            self.root.after(1000, self.check_for_updates)
         
     def load_config(self):
         import json
@@ -83,13 +88,21 @@ class BotGUI:
 
     def save_config(self):
         import json
+        existing_data = {}
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, "r") as f:
+                    existing_data = json.load(f)
+            except Exception:
+                pass
         data = {
             "email": self.get_entry_val(self.entry_email),
             "password": self.get_entry_val(self.entry_password),
             "default_phone": self.get_entry_val(self.entry_phone),
             "excel_path": self.get_entry_val(self.entry_excel),
             "auto_advance": self.var_auto_advance.get(),
-            "headless": self.var_headless.get()
+            "headless": self.var_headless.get(),
+            "activation_key": existing_data.get("activation_key", "")
         }
         try:
             with open(self.config_file, "w") as f:
@@ -799,6 +812,152 @@ class BotGUI:
         grid_frame.columnconfigure(1, weight=1)
         
         btn_resume.focus_set()
+ 
+    # ------------------------------------------------------------
+    #  LICENSING & ACTIVATION SYSTEM
+    # ------------------------------------------------------------
+    
+    def get_device_id(self):
+        import uuid
+        import hashlib
+        mac = str(uuid.getnode())
+        h = hashlib.sha256(f"botckg-{mac}".encode()).hexdigest()
+        return f"{h[0:4]}-{h[4:8]}-{h[8:12]}".upper()
+
+    def generate_activation_key(self, device_id):
+        import hashlib
+        secret_salt = "arzachel_bot_ckg_salt_2026_super_secure"
+        h = hashlib.sha256(f"{device_id}-{secret_salt}".encode()).hexdigest()
+        return f"{h[12:16]}-{h[16:20]}-{h[20:24]}-{h[24:28]}".upper()
+
+    def check_activation(self):
+        config = self.load_config()
+        saved_key = config.get("activation_key", "")
+        expected_key = self.generate_activation_key(self.device_id)
+        return saved_key == expected_key
+
+    def build_activation_ui(self):
+        for widget in self.root.winfo_children():
+            widget.destroy()
+            
+        self.root.title("Aktivasi Arzachel Bot CKG")
+        
+        # Center container
+        container = tk.Frame(self.root, bg=self.c_bg)
+        container.place(relx=0.5, rely=0.5, anchor="center")
+        
+        # Premium Card
+        card = tk.Frame(container, bg=self.c_card, highlightthickness=1, highlightbackground=self.c_accent, padx=30, pady=30)
+        card.pack()
+        
+        # Lock Icon & Title
+        lbl_lock = tk.Label(card, text="🔒", bg=self.c_card, fg=self.c_accent, font=("Helvetica", 32))
+        lbl_lock.pack(pady=(0, 10))
+        
+        lbl_title = tk.Label(card, text="AKTIVASI APLIKASI", bg=self.c_card, fg=self.c_text, font=("Helvetica", 14, "bold"))
+        lbl_title.pack(pady=(0, 5))
+        
+        lbl_sub = tk.Label(card, text="Arzachel Bot CKG (ASIK Kemenkes) memerlukan lisensi untuk digunakan.", bg=self.c_card, fg=self.c_text_muted, font=("Helvetica", 9))
+        lbl_sub.pack(pady=(0, 20))
+        
+        # Payment Info Box
+        pay_info_text = (
+            "💳 METODE AKTIVASI (Rp 160.000):\n"
+            "- Transfer DANA / OVO / GoPay: 081234567890\n"
+            "- Transfer Bank: Bank BCA 123456789 a.n. Akhmad\n\n"
+            "Langkah Aktivasi:\n"
+            "1. Lakukan transfer sebesar Rp 160.000\n"
+            "2. Salin DEVICE ID di bawah ini\n"
+            "3. Kirimkan bukti transfer + DEVICE ID ke WhatsApp Admin\n"
+            "4. Masukkan KUNCI AKTIVASI yang Anda terima di bawah"
+        )
+        pay_box = tk.Text(card, bg="#0a0a0f", fg="#cccccc", font=("Helvetica", 9), wrap="word", width=50, height=8, bd=0, highlightthickness=1, highlightbackground="#323246", padx=10, pady=10)
+        pay_box.insert("1.0", pay_info_text)
+        pay_box.config(state="disabled")
+        pay_box.pack(pady=(0, 15))
+        
+        # Device ID
+        device_frame = tk.Frame(card, bg=self.c_card)
+        device_frame.pack(fill="x", pady=(0, 15))
+        
+        tk.Label(device_frame, text="DEVICE ID ANDA:", bg=self.c_card, fg=self.c_text_muted, font=("Helvetica", 8, "bold")).pack(anchor="w")
+        
+        id_inner = tk.Frame(device_frame, bg=self.c_bg, highlightthickness=1, highlightbackground="#323246")
+        id_inner.pack(fill="x", pady=(2, 0))
+        
+        lbl_device_id = tk.Label(id_inner, text=self.device_id, bg=self.c_bg, fg=self.c_yellow, font=("Courier", 12, "bold"))
+        lbl_device_id.pack(side="left", padx=10, pady=5)
+        
+        # Copy Button
+        def copy_id():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.device_id)
+            messagebox.showinfo("Sukses", "Device ID berhasil disalin ke clipboard!")
+            
+        btn_copy = self.create_flat_button(id_inner, "📋 SALIN", copy_id, bg=self.c_card_elev, hover_bg="#323246", width=8)
+        btn_copy.pack(side="right", padx=5, pady=3)
+        
+        # Contact Admin Button
+        def open_wa():
+            import webbrowser
+            url = f"https://wa.me/6281234567890?text=Halo%20Admin,%20saya%20ingin%20aktivasi%20Bot%20CKG.%20Ini%20Device%20ID%20saya:%20{self.device_id}"
+            webbrowser.open(url)
+            
+        btn_wa = self.create_flat_button(card, "💬 HUBUNGI ADMIN VIA WHATSAPP", open_wa, bg="#25d366", hover_bg="#128c7e", height=1)
+        btn_wa.pack(fill="x", pady=(0, 20))
+        
+        # Activation Key Input
+        tk.Label(card, text="KUNCI AKTIVASI:", bg=self.c_card, fg=self.c_text_muted, font=("Helvetica", 8, "bold")).pack(anchor="w")
+        
+        key_inner = tk.Frame(card, bg=self.c_bg, highlightthickness=1, highlightbackground="#323246", highlightcolor=self.c_accent)
+        key_inner.pack(fill="x", pady=(2, 15))
+        
+        self.entry_activation_key = tk.Entry(key_inner, bg=self.c_bg, fg=self.c_text, insertbackground=self.c_text, bd=0, font=("Helvetica", 11, "bold"), justify="center")
+        self.entry_activation_key.pack(fill="both", expand=True, padx=8, pady=6)
+        self.entry_activation_key.focus_set()
+        
+        # Activate Button
+        def on_activate():
+            key = self.entry_activation_key.get().strip()
+            if not key:
+                messagebox.showerror("Error", "Silakan masukkan Kunci Aktivasi!")
+                return
+                
+            expected = self.generate_activation_key(self.device_id)
+            if key.upper() == expected:
+                # Save key to config
+                import json
+                config = {}
+                if self.config_file.exists():
+                    try:
+                        with open(self.config_file, "r") as f:
+                            config = json.load(f)
+                    except Exception:
+                        pass
+                config["activation_key"] = key.upper()
+                try:
+                    with open(self.config_file, "w") as f:
+                        json.dump(config, f, indent=4)
+                except Exception:
+                    pass
+                    
+                messagebox.showinfo("Sukses", "Aktivasi Berhasil! Terima kasih telah membeli lisensi.")
+                
+                # Rebuild main UI
+                for widget in self.root.winfo_children():
+                    widget.destroy()
+                self.build_ui()
+                self.auto_detect_excel()
+                self.root.after(50, self.poll_queues)
+                self.root.after(1000, self.check_for_updates)
+            else:
+                messagebox.showerror("Gagal Aktivasi", "Kunci Aktivasi tidak valid! Silakan periksa kembali atau hubungi admin.")
+                
+        btn_activate = self.create_flat_button(card, "✅ AKTIFKAN SEKARANG", on_activate, bg=self.c_green, hover_bg=self.c_green_hover, height=2, font=("Helvetica", 10, "bold"))
+        btn_activate.pack(fill="x")
+        
+        # Bind Return key to activation
+        self.entry_activation_key.bind("<Return>", lambda e: on_activate())
 
     # ------------------------------------------------------------
     #  AUTO-UPDATE SYSTEM

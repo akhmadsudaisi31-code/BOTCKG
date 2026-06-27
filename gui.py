@@ -908,6 +908,25 @@ class BotGUI:
                 lbl_err = tk.Label(card, text=f"Gagal memuat barcode: {e}", bg=self.c_card, fg=self.c_red, font=("Helvetica", 8))
                 lbl_err.pack(pady=(0, 10))
         
+        # Account Number Box with Copy Button
+        bank_frame = tk.Frame(card, bg=self.c_bg, highlightthickness=1, highlightbackground="#323246")
+        bank_frame.pack(fill="x", pady=(0, 15))
+        
+        bank_details = tk.Frame(bank_frame, bg=self.c_bg)
+        bank_details.pack(side="left", padx=10, pady=5)
+        
+        tk.Label(bank_details, text="BANK JAGO (Akhmad Sudaisi)", bg=self.c_bg, fg=self.c_text_muted, font=("Helvetica", 8, "bold"), anchor="w").pack(fill="x")
+        lbl_rek = tk.Label(bank_details, text="105295129701", bg=self.c_bg, fg=self.c_green, font=("Courier", 12, "bold"), anchor="w")
+        lbl_rek.pack(fill="x")
+        
+        def copy_rek():
+            self.root.clipboard_clear()
+            self.root.clipboard_append("105295129701")
+            messagebox.showinfo("Sukses", "Nomor Rekening Bank Jago berhasil disalin ke clipboard!")
+            
+        btn_copy_rek = self.create_flat_button(bank_frame, "📋 SALIN REK", copy_rek, bg=self.c_card_elev, hover_bg="#323246", width=12)
+        btn_copy_rek.pack(side="right", padx=10, pady=5)
+        
         # Device ID
         device_frame = tk.Frame(card, bg=self.c_card)
         device_frame.pack(fill="x", pady=(0, 15))

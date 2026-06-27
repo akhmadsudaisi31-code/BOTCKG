@@ -5,10 +5,5 @@ __pycache__/
 screenshots/
 .env
 .DS_Store
-gui_config.json
-ckg.xlsx
-*.xlsx
-!template_ckg.xlsx
 *.bak
 *.log
-keygen.py

@@ -863,8 +863,9 @@ class BotGUI:
         # Payment Info Box
         pay_info_text = (
             "💳 METODE AKTIVASI (Rp 160.000):\n"
-            "- Transfer DANA / OVO / GoPay: 081234567890\n"
-            "- Transfer Bank: Bank BCA 123456789 a.n. Akhmad\n\n"
+            "- Transfer Bank: Bank Jago\n"
+            "  Nomor Rekening: 105295129701\n"
+            "  Atas Nama: Akhmad Sudaisi\n\n"
             "Langkah Aktivasi:\n"
             "1. Lakukan transfer sebesar Rp 160.000\n"
             "2. Salin DEVICE ID di bawah ini\n"
@@ -875,6 +876,37 @@ class BotGUI:
         pay_box.insert("1.0", pay_info_text)
         pay_box.config(state="disabled")
         pay_box.pack(pady=(0, 15))
+        
+        # QRIS / Barcode scan logic if local barcode image exists
+        qris_path = None
+        for name in ["qris", "barcode", "QRIS", "BARCODE"]:
+            for ext in [".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG"]:
+                p = Path(f"{name}{ext}")
+                if p.exists():
+                    qris_path = p
+                    break
+            if qris_path:
+                break
+                
+        if qris_path:
+            try:
+                img_qris = Image.open(qris_path)
+                # Fit to 180x180 pixels nicely
+                img_qris = img_qris.resize((180, 180), Image.Resampling.LANCZOS)
+                img_tk = ImageTk.PhotoImage(img_qris)
+                
+                qris_frame = tk.Frame(card, bg=self.c_bg, bd=1, relief="solid", highlightthickness=0)
+                qris_frame.pack(pady=(0, 10))
+                
+                lbl_qris_img = tk.Label(qris_frame, image=img_tk, bg=self.c_bg)
+                lbl_qris_img.image = img_tk  # Keep reference
+                lbl_qris_img.pack(padx=5, pady=5)
+                
+                lbl_qris_hint = tk.Label(card, text="📸 Scan Barcode untuk Membayar Rp 160.000", bg=self.c_card, fg=self.c_text_muted, font=("Helvetica", 8, "italic"))
+                lbl_qris_hint.pack(pady=(0, 15))
+            except Exception as e:
+                lbl_err = tk.Label(card, text=f"Gagal memuat barcode: {e}", bg=self.c_card, fg=self.c_red, font=("Helvetica", 8))
+                lbl_err.pack(pady=(0, 10))
         
         # Device ID
         device_frame = tk.Frame(card, bg=self.c_card)
@@ -900,7 +932,7 @@ class BotGUI:
         # Contact Admin Button
         def open_wa():
             import webbrowser
-            url = f"https://wa.me/6281234567890?text=Halo%20Admin,%20saya%20ingin%20aktivasi%20Bot%20CKG.%20Ini%20Device%20ID%20saya:%20{self.device_id}"
+            url = f"https://wa.me/6282333017615?text=Halo%20Admin,%20saya%20ingin%20aktivasi%20Bot%20CKG.%20Ini%20Device%20ID%20saya:%20{self.device_id}"
             webbrowser.open(url)
             
         btn_wa = self.create_flat_button(card, "💬 HUBUNGI ADMIN VIA WHATSAPP", open_wa, bg="#25d366", hover_bg="#128c7e", height=1)

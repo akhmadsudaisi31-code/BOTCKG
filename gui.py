@@ -58,6 +58,9 @@ class BotGUI:
         # Start periodic poller (50ms interval)
         self.root.after(50, self.poll_queues)
         
+        # Check for updates in background (1 second delay)
+        self.root.after(1000, self.check_for_updates)
+        
     def load_config(self):
         import json
         defaults = {
@@ -130,6 +133,10 @@ class BotGUI:
         
     def build_ui(self):
         config_data = self.load_config()
+        
+        # Top container for banners/notices (e.g. Update Banner)
+        self.banner_container = tk.Frame(self.root, bg=self.c_bg)
+        self.banner_container.pack(side="top", fill="x")
         
         # Main layout: Two main columns
         self.main_pane = tk.Frame(self.root, bg=self.c_bg)
@@ -792,6 +799,150 @@ class BotGUI:
         grid_frame.columnconfigure(1, weight=1)
         
         btn_resume.focus_set()
+
+    # ------------------------------------------------------------
+    #  AUTO-UPDATE SYSTEM
+    # ------------------------------------------------------------
+    
+    def check_for_updates(self):
+        self.append_log("Memeriksa pembaruan bot...", "INFO")
+        threading.Thread(target=self._bg_check_updates, daemon=True).start()
+
+    def _bg_check_updates(self):
+        import subprocess
+        
+        # Configure Git to not prompt for credentials if not configured (to avoid hanging)
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+        
+        try:
+            # 1. Run git fetch to update remote tracking branch info
+            subprocess.run(["git", "fetch"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=15)
+            
+            # 2. Get local commit hash
+            res_local = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, env=env, timeout=5)
+            local_hash = res_local.stdout.strip()
+            
+            # 3. Get remote tracking branch commit hash
+            res_remote = subprocess.run(["git", "rev-parse", "@{u}"], capture_output=True, text=True, env=env, timeout=5)
+            remote_hash = res_remote.stdout.strip()
+            
+            if local_hash and remote_hash and local_hash != remote_hash:
+                # There is an update! Show banner
+                self.root.after(0, self.show_update_banner)
+            else:
+                self.root.after(0, lambda: self.append_log("Aplikasi sudah menggunakan versi terbaru.", "OK"))
+        except Exception as e:
+            # Silent fallback if offline or git repo hasn't been set up with remote yet
+            self.root.after(0, lambda: self.append_log("Pemeriksaan update selesai (remote repository tidak aktif/belum dikonfigurasi).", "INFO"))
+
+    def show_update_banner(self):
+        # Clear existing banner widgets if any
+        for widget in self.banner_container.winfo_children():
+            widget.destroy()
+            
+        self.append_log("Pembaruan aplikasi terdeteksi di server!", "WARN")
+        
+        # Premium Slate Blue banner with Cyan/Teal border
+        banner = tk.Frame(self.banner_container, bg="#1e293b", highlightthickness=1, highlightbackground=self.c_accent, height=45)
+        banner.pack(fill="x", padx=15, pady=(15, 0))
+        banner.pack_propagate(False)
+        
+        # Message Label
+        lbl = tk.Label(
+            banner, text="📢 Pembaruan Tersedia! Silakan unduh versi terbaru untuk performa dan fitur terbaru.", 
+            bg="#1e293b", fg=self.c_text, font=("Helvetica", 9, "bold")
+        )
+        lbl.pack(side="left", padx=15, pady=10)
+        
+        # Update Button
+        self.btn_run_update = self.create_flat_button(
+            banner, "📥 PERBARUI SEKARANG", self.run_application_update,
+            bg=self.c_accent, hover_bg=self.c_accent_hover, width=20, font=("Helvetica", 8, "bold")
+        )
+        self.btn_run_update.pack(side="right", padx=10, pady=8)
+        
+        # Close Button
+        btn_close = tk.Button(
+            banner, text="✕", command=lambda: banner.destroy(),
+            bg="#1e293b", fg=self.c_text_muted, activebackground="#1e293b", activeforeground=self.c_text,
+            bd=0, highlightthickness=0, relief="flat", font=("Helvetica", 10, "bold"), cursor="hand2"
+        )
+        btn_close.pack(side="right", padx=(5, 10), pady=10)
+        btn_close.bind("<Enter>", lambda e: btn_close.config(fg=self.c_text))
+        btn_close.bind("<Leave>", lambda e: btn_close.config(fg=self.c_text_muted))
+
+    def run_application_update(self):
+        self.btn_run_update.config(state="disabled", text="⏳ MEMPERBARUI...")
+        self.append_log("Memulai proses pembaruan otomatis di latar belakang...", "WAIT")
+        
+        def do_update():
+            import subprocess
+            import sys
+            
+            env = os.environ.copy()
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+            
+            try:
+                # 1. git pull
+                self.root.after(0, lambda: self.append_log("Menjalankan git pull...", "WAIT"))
+                res_pull = subprocess.run(["git", "pull"], capture_output=True, text=True, env=env, timeout=30)
+                
+                if res_pull.returncode != 0:
+                    err_msg = res_pull.stderr.strip() or res_pull.stdout.strip()
+                    raise Exception(f"Gagal melakukan git pull: {err_msg}")
+                    
+                self.root.after(0, lambda: self.append_log("Git pull berhasil dijalankan.", "OK"))
+                if res_pull.stdout:
+                    self.root.after(0, lambda: self.append_log(res_pull.stdout.strip(), "INFO"))
+                
+                # Get the correct paths of pip and playwright relative to sys.executable (inside venv)
+                python_dir = Path(sys.executable).parent
+                if sys.platform == "win32":
+                    pip_path = str(python_dir / "pip.exe")
+                    playwright_path = str(python_dir / "playwright.exe")
+                else:
+                    pip_path = str(python_dir / "pip")
+                    playwright_path = str(python_dir / "playwright")
+                    
+                # 2. pip install -r requirements.txt
+                self.root.after(0, lambda: self.append_log("Memeriksa dan memperbarui pustaka dependensi (pip install)...", "WAIT"))
+                res_pip = subprocess.run([pip_path, "install", "-r", "requirements.txt"], capture_output=True, text=True, timeout=60)
+                if res_pip.returncode != 0:
+                    err_msg = res_pip.stderr.strip() or res_pip.stdout.strip()
+                    self.root.after(0, lambda: self.append_log(f"Peringatan saat pip install: {err_msg}", "WARN"))
+                else:
+                    self.root.after(0, lambda: self.append_log("Instalasi dependensi Python selesai.", "OK"))
+                    
+                # 3. playwright install chromium
+                self.root.after(0, lambda: self.append_log("Memeriksa browser Chromium Playwright...", "WAIT"))
+                res_pw = subprocess.run([playwright_path, "install", "chromium"], capture_output=True, text=True, timeout=90)
+                if res_pw.returncode != 0:
+                    err_msg = res_pw.stderr.strip() or res_pw.stdout.strip()
+                    self.root.after(0, lambda: self.append_log(f"Peringatan saat playwright install: {err_msg}", "WARN"))
+                else:
+                    self.root.after(0, lambda: self.append_log("Pemeriksaan browser Playwright selesai.", "OK"))
+                    
+                # Success
+                def success_ui():
+                    self.append_log("Pembaruan berhasil diterapkan! Silakan buka kembali aplikasi.", "OK")
+                    for widget in self.banner_container.winfo_children():
+                        widget.destroy()
+                    messagebox.showinfo("Sukses", "Bot berhasil diperbarui! Silakan tutup dan buka kembali aplikasi untuk menerapkan perubahan.")
+                    
+                self.root.after(0, success_ui)
+                
+            except Exception as e:
+                def fail_ui(err_err):
+                    self.append_log(f"Gagal memperbarui aplikasi: {err_err}", "ERR")
+                    if hasattr(self, "btn_run_update") and self.btn_run_update.winfo_exists():
+                        self.btn_run_update.config(state="normal", text="📥 PERBARUI SEKARANG")
+                    messagebox.showerror("Gagal Update", f"Terjadi kesalahan saat memperbarui bot:\n{err_err}")
+                self.root.after(0, lambda: fail_ui(str(e)))
+                
+        threading.Thread(target=do_update, daemon=True).start()
 
     # ------------------------------------------------------------
     #  AUTO DETECTION & EXCEL BROWSE
